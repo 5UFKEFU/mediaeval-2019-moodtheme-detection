@@ -1,23 +1,25 @@
-import os, pickle, csv
+import os
+import csv
 import numpy as np
 import torch
 from torch.utils import data
+import librosa
 from transforms import get_transforms
 
-def get_spectogram(full_spect, size=1400):
+def get_spectrogram(full_spect, size=1400):
     full_len = full_spect.shape[1]
     if full_len > size:
         audio = full_spect[:, :size]
     else:
-        diff = size-full_len
+        diff = size - full_len
         audio = full_spect
-        while(diff > 0):
-            if diff>full_len:
-                audio = np.concatenate((audio,full_spect), axis=1)
-                diff = diff-full_len
+        while diff > 0:
+            if diff > full_len:
+                audio = np.concatenate((audio, full_spect), axis=1)
+                diff -= full_len
             else:
-                audio = np.concatenate((audio, full_spect[:,:diff]), axis=1)
-                diff = 0                
+                audio = np.concatenate((audio, full_spect[:, :diff]), axis=1)
+                diff = 0
     return audio
 
 class AudioFolder(data.Dataset):
@@ -28,62 +30,75 @@ class AudioFolder(data.Dataset):
         self.spect_len = spect_len
         self.labels_to_idx = labels_to_idx
         self.prepare_data(tsv_path)
-        if train:
-            self.transform = get_transforms(
-                                train=True,
-                                size=spect_len,
-                                wrap_pad_prob=0.5,
-                                resize_scale=(0.8, 1.0),
-                                resize_ratio=(1.7, 2.3),
-                                resize_prob=0.33,
-                                spec_num_mask=2,
-                                spec_freq_masking=0.15,
-                                spec_time_masking=0.20,
-                                spec_prob=0.5
-                            )
-        else:
-            self.transform = get_transforms(False, spect_len)
+
+        self.transform = get_transforms(
+            train=train,
+            size=spect_len,
+            wrap_pad_prob=0.5 if train else 0.0,
+            resize_scale=(0.8, 1.0) if train else (1.0, 1.0),
+            resize_ratio=(1.7, 2.3) if train else (2.0, 2.0),
+            resize_prob=0.33 if train else 0.0,
+            spec_num_mask=2 if train else 0,
+            spec_freq_masking=0.15 if train else 0.0,
+            spec_time_masking=0.20 if train else 0.0,
+            spec_prob=0.5 if train else 0.0
+        )
 
     def __getitem__(self, index):
-        fn = os.path.join(self.root, self.paths[index][:-3]+'npy')
-        full_spect = np.array(np.load(fn))
-        audio = get_spectogram(full_spect, self.spect_len)
+        # 读取 mp3 文件
+        fn = os.path.join(self.root, self.paths[index])
+        y, sr = librosa.load(fn, sr=16000, mono=True, duration=60)  # 采样率 16k，限制最多 60秒
+    
+        # 提取 log-mel 特征
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+        log_mel_spec = librosa.power_to_db(mel_spec)
+    
+        # 不要 expand_dims
+        full_spect = log_mel_spec  # (freq, time)
+    
+        # 适配网络要求的大小
+        audio = get_spectrogram(full_spect, self.spect_len)  # get_spectrogram 默认已经是 (freq, time)
+        
+        # 这里 self.transform 要求输入 2D，如果 transform 里面需要 Image.fromarray，要确保是 (H, W)，而不是 (1, H, W)
         audio = self.transform(audio)
+    
+        # 之后返回 audio + labels
         tags = self.tags[index]
         labels = self.one_hot(tags)
         return audio, labels
-
+        
+    
     def __len__(self):
         return len(self.paths)
-    
+
     def one_hot(self, tags):
         labels = torch.LongTensor(tags)
         target = torch.zeros(self.num_classes).scatter_(0, labels, 1)
         return target
-    
+
     def prepare_data(self, path_to_tsv):
-    
         all_dict = {
-        'PATH': [],
-        'TAGS': []
+            'PATH': [],
+            'TAGS': []
         }
         with open(path_to_tsv) as tsvfile:
             tsvreader = csv.reader(tsvfile, delimiter="\t")
-            next(tsvreader) #Reading the first line
+            next(tsvreader)  # 跳过表头
             for line in tsvreader:
-                all_dict['PATH'].append(line[3])
-                all_dict['TAGS'].append(line[5:])
+                all_dict['PATH'].append(line[3])  # mp3路径列
+                all_dict['TAGS'].append(line[5:]) # 标签列
 
         self.paths = all_dict['PATH']
         self.tags = [[self.labels_to_idx[j] for j in i] for i in all_dict['TAGS']]
 
-
-
-def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=16, num_workers=4, shuffle=True, drop_last=True):
-    data_loader = data.DataLoader(dataset=AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=True),
-                                  batch_size=batch_size,
-                                  shuffle=shuffle,
-                                  num_workers=num_workers,
-                                  pin_memory=True,
-                                  drop_last=drop_last)
-    return data_loader
+def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=16, num_workers=4, shuffle=True, drop_last=True, train=True):
+    dataset = AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=train)
+    loader = data.DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=drop_last
+    )
+    return loader

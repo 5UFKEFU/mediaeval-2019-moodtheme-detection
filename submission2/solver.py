@@ -24,7 +24,7 @@ class Solver():
         # Training settings
         self.n_epochs = 120
         self.lr = 1e-4
-        self.log_step = 100
+        self.log_step = 1
         self.is_cuda = torch.cuda.is_available()
         self.model_save_path = config['log_dir']
         self.batch_size = config['batch_size']

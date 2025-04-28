@@ -23,21 +23,35 @@ class MusicSelfAttModel(nn.Module):
              nn.Linear(256, NUM_CLASSES),
              nn.Sigmoid())
         
-    def forward(self,x):
-        x = x.view(-1, 96, 16, 256) # 16*256=4096 input
-        x = x.permute(0,2,1,3)
-        x = x.contiguous().view(-1,96,256)
+    def forward(self, x):
+        # x: (batch, 1, freq, time)
+        B, C, F, T = x.size()  # 注意这里是四个值
+    
+        if C == 1:
+            x = x.squeeze(1)  # 变成 (B, F, T)
+    
+        B, F, T = x.size()  # 重新取 size，现在是3个
+    
+        if F != 96:
+            x = torch.nn.functional.interpolate(x.unsqueeze(1), size=(96, T), mode='bilinear', align_corners=False).squeeze(1)
+    
+        if T != 4096:
+            x = torch.nn.functional.interpolate(x.unsqueeze(1), size=(96, 4096), mode='bilinear', align_corners=False).squeeze(1)
+    
+        x = x.view(-1, 96, 16, 256)
+        x = x.permute(0, 2, 1, 3)
+        x = x.contiguous().view(-1, 96, 256)
         x = x.unsqueeze(1)
         x = self.mirex(x)
+    
         att = x.view(-1, 16, 256)
         att = self.att_model(att)
-        clf = x.view(-1,256)
+        clf = x.view(-1, 256)
         clf = self.classifier(clf)
-        clf = clf.view(-1,16,56)
+        clf = clf.view(-1, 16, 56)
         clf = clf.mean(dim=1)
-
-        return att,clf
-
+    
+        return att, clf
 
 
 class MobileNetV2(nn.Module):    
