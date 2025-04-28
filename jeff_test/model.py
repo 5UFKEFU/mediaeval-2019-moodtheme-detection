@@ -1,62 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-卷积 + 自注意力混合模型。
+MobileNetV2 -> 256-d 特征
+Self-Attention + MLP → 56 标签
+兼容 (B,96,T) 旧格式 与 (B,1,96,T) 新格式
 """
 import torch, torch.nn as nn, torchvision
 from self_attention import AttentionModule
 
-NUM_CLASSES  = 56
-HIDDEN_SIZE  = 256
+NUM_CLS, HID = 56, 256          # 不动
 
-# ---------- MobileNetV2 分支 ----------
-class MobileNetV2(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        # 灰度 → 3 通道
-        self.bw2col = nn.Sequential(
-            nn.BatchNorm2d(1),
-            nn.Conv2d(1, 10, 1), nn.ReLU(),
-            nn.Conv2d(10, 3, 1), nn.ReLU()
-        )
-        # 轻量级骨干
-        self.mv2 = torchvision.models.mobilenet_v2(pretrained=False)
-        # 输出层
-        self.out_conv = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(1280, HIDDEN_SIZE)
-        )
-    def forward(self, x):
-        x = self.bw2col(x)
-        x = self.mv2.features(x)
-        x = self.out_conv(x)
-        return x
-
-# ---------- 主模型 ----------
 class MusicSelfAttModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.cnn_branch = MobileNetV2(NUM_CLASSES)
-        self.att_branch = nn.Sequential(
-            AttentionModule(),
-            nn.Dropout(0.2),
-            nn.Linear(HIDDEN_SIZE, NUM_CLASSES)
+        self.backbone = _MobileNetV2()
+        self.att_path = nn.Sequential(
+            AttentionModule(), nn.Dropout(0.2),
+            nn.Linear(HID, NUM_CLS)
         )
-        self.classifier = nn.Sequential(
-            nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE), nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(HIDDEN_SIZE, NUM_CLASSES),
-            nn.Sigmoid()
+        self.cls_path = nn.Sequential(
+            nn.Dropout(0.2), nn.Linear(HID, HID),
+            nn.Dropout(0.2), nn.Linear(HID, NUM_CLS)
         )
 
     def forward(self, x):
-        # 输入 (B, 96, 1400) →
-        x = x.view(-1, 1, 96, 1400)
-        feat = self.cnn_branch(x)          # (B, 256)
-        att  = feat.view(-1, 16, HIDDEN_SIZE)  # 伪造 seq_len=16
-        att  = self.att_branch(att)            # (B, 16, 56)
-        att  = torch.mean(att, dim=1)          # Pool
-        out  = self.classifier(feat) * att     # 简单融合
-        return out
+        # ① 把输入统一成 (B,1,96,T)
+        if x.dim() == 3:           # (B,96,T)
+            x = x.unsqueeze(1)
+        elif x.dim() == 4:         # (B,1,96,T)
+            pass
+        else:
+            raise ValueError(f"Bad shape {x.shape}")
 
+        feat = self.backbone(x)                    # (B,256)
+        att  = self.att_path(feat.unsqueeze(1).repeat(1,16,1)).mean(1)
+        cls  = self.cls_path(feat)
+        
+        # 确保输出在合理范围内
+        att = torch.clamp(att, min=-100, max=100)
+        cls = torch.clamp(cls, min=-100, max=100)
+        
+        return att, cls                           # 两路输出
+
+# --------------------------------------------------
+class _MobileNetV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.to3ch = nn.Sequential(
+            nn.BatchNorm2d(1),
+            nn.Conv2d(1, 3, 1), nn.ReLU()
+        )
+        self.net = torchvision.models.mobilenet_v2(weights=None).features
+        self.head = nn.Sequential(
+            nn.AdaptiveMaxPool2d(1),
+            nn.Flatten(),
+            nn.Linear(1280, HID)
+        )
+
+    def forward(self, x):          # x:(B,1,96,T)
+        x = self.head(self.net(self.to3ch(x)))
+        return x

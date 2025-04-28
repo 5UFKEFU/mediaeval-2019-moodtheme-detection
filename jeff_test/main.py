@@ -1,58 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-入口脚本：负责准备数据集 DataLoader、启动 Solver 训练 / 验证 / 测试。
-兼容 CUDA 12 + CentOS 8。
-"""
-import os
 import torch.multiprocessing as mp
+import os
+
+from sklearn.metrics import precision_recall_curve
+import numpy as np
+
 from dataloader import get_audio_loader
 from solver import Solver
 
-# --------------------------- 路径配置 ---------------------------
-PATH = "../data"
-DATA_PATH = f"{PATH}/mediaeval-2019-jamendo/"
-LABELS_TXT = f"{PATH}/moodtheme_split.txt"
-TRAIN_PATH = f"{PATH}/autotagging_moodtheme-train.tsv"
-VAL_PATH   = f"{PATH}/autotagging_moodtheme-validation.tsv"
-TEST_PATH  = f"{PATH}/autotagging_moodtheme-test.tsv"
+# Set paths
+PATH = '../data'
+DATA_PATH = f'{PATH}/mediaeval-2019-jamendo/'
+LABELS_TXT = f'{PATH}/moodtheme_split.txt'
+TRAIN_PATH = f'{PATH}/autotagging_moodtheme-train.tsv'
+VAL_PATH = f'{PATH}/autotagging_moodtheme-validation.tsv'
+TEST_PATH = f'{PATH}/autotagging_moodtheme-test.tsv'
 
 CONFIG = {
-    "log_dir":  "./output",
-    "batch_size": 8,
-}
+        'log_dir': './output',
+        'batch_size': 8
+    }
 
-# --------------------------- 辅助函数 ---------------------------
 def get_labels_to_idx(labels_txt):
-    labels_to_idx, tag_list = {}, []
+    labels_to_idx = {}
+    tag_list = []
     with open(labels_txt) as f:
-        for i, line in enumerate(f):
-            label = line.strip()
-            labels_to_idx[label] = i
-            tag_list.append(label)
+        lines = f.readlines()
+
+    for i,l in enumerate(lines):
+        tag_list.append(l.strip())
+        labels_to_idx[l.strip()] = i
+
     return labels_to_idx, tag_list
 
 def train():
-    labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)
+    config = CONFIG
+    labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)    
 
-    train_loader1 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx,
-                                     batch_size=CONFIG["batch_size"])
-    train_loader2 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx,
-                                     batch_size=CONFIG["batch_size"])
-    val_loader    = get_audio_loader(DATA_PATH, VAL_PATH,  labels_to_idx,
-                                     batch_size=CONFIG["batch_size"],
-                                     shuffle=False)
-
-    solver = Solver(CONFIG,
-                    train_loader1=train_loader1,
-                    train_loader2=train_loader2,
-                    valid_loader=val_loader,
-                    tag_list=tag_list)
+    train_loader1 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx, batch_size=config['batch_size'])
+    train_loader2 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx, batch_size=config['batch_size'])
+    val_loader = get_audio_loader(DATA_PATH, VAL_PATH, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    solver = Solver(train_loader1,train_loader2, val_loader, tag_list, config)
     solver.train()
 
-# --------------------------- 主入口 ---------------------------
-if __name__ == "__main__":
-    # 在 CUDA 环境下安全启动多进程
-    mp.set_start_method("spawn", force=True)
+def predict():
+    config = CONFIG
+    labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)
+
+    test_loader = get_audio_loader(DATA_PATH, TEST_PATH, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+
+    solver = Solver(test_loader,None, None, tag_list, config)
+    predictions = solver.test()
+
+    np.save(f"{CONFIG['log_dir']}/predictions.npy", predictions)
+
+
+if __name__ == '__main__':
+    # 设置多进程启动方法为 spawn
+    mp.set_start_method('spawn', force=True)
+
+    #Train the data
     train()
 
+    #Predict and create submissions
+    predict()
