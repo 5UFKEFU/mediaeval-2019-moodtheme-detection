@@ -1,3 +1,7 @@
+import os
+# 设置PyTorch内存分配器配置
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+
 from sklearn.metrics import precision_recall_curve
 import numpy as np
 
@@ -9,12 +13,16 @@ PATH = '../data'
 DATA_PATH = f'{PATH}/mediaeval-2019-jamendo/'
 LABELS_TXT = f'{PATH}/moodtheme_split.txt'
 TRAIN_PATH = f'{PATH}/autotagging_moodtheme-train.tsv'
-VAL_PATH = f'{PATH}/autotagging_moodtheme-validation.tsv'
+VAL_PATH = f'{PATH}/autotagging_moodtheme-valid.tsv'
 TEST_PATH = f'{PATH}/autotagging_moodtheme-test.tsv'
 
 CONFIG = {
         'log_dir': './output',
-        'batch_size': 8
+        'batch_size': 16,
+        'num_workers': 4,
+        'pin_memory': True,
+        'prefetch_factor': 2,
+        'persistent_workers': True
     }
 
 def get_labels_to_idx(labels_txt):
@@ -48,7 +56,13 @@ def predict():
     solver = Solver(test_loader,None, None, tag_list, config)
     predictions = solver.test()
 
-    np.save(f"{CONFIG['log_dir']}/predictions.npy", predictions)
+    # 分别保存预测结果的不同部分
+    np.save(f"{CONFIG['log_dir']}/predictions_array.npy", predictions[0])  # 预测数组
+    np.save(f"{CONFIG['log_dir']}/ground_truth.npy", predictions[1])      # 真实标签
+    np.save(f"{CONFIG['log_dir']}/roc_auc.npy", predictions[2])          # ROC AUC
+    np.save(f"{CONFIG['log_dir']}/pr_auc.npy", predictions[3])           # PR AUC
+    
+    print(f"Predictions saved successfully in {CONFIG['log_dir']}")
 
 
 if __name__=="__main__":

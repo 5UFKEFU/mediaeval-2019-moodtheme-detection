@@ -47,7 +47,13 @@ class AudioFolder(data.Dataset):
     def __getitem__(self, index):
         # 读取 mp3 文件
         fn = os.path.join(self.root, self.paths[index])
-        y, sr = librosa.load(fn, sr=16000, mono=True, duration=60)  # 采样率 16k，限制最多 60秒
+        try:
+            y, sr = librosa.load(fn, sr=16000, mono=True, duration=60)  # 采样率 16k，限制最多 60秒
+        except Exception as e:
+            print(f"Error loading file {fn}: {str(e)}")
+            # Return a zero tensor with the same shape as expected
+            y = np.zeros(16000 * 60)  # 60 seconds of silence at 16kHz
+            sr = 16000
     
         # 提取 log-mel 特征
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
@@ -91,7 +97,7 @@ class AudioFolder(data.Dataset):
         self.paths = all_dict['PATH']
         self.tags = [[self.labels_to_idx[j] for j in i] for i in all_dict['TAGS']]
 
-def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=16, num_workers=4, shuffle=True, drop_last=True, train=True):
+def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=32, num_workers=8, shuffle=True, drop_last=True, train=True):
     dataset = AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=train)
     loader = data.DataLoader(
         dataset=dataset,
@@ -99,6 +105,8 @@ def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=16, num_workers=4
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=drop_last
+        drop_last=drop_last,
+        prefetch_factor=2,
+        persistent_workers=True
     )
     return loader

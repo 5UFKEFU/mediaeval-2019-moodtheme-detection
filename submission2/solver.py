@@ -26,6 +26,15 @@ class Solver():
         self.lr = 1e-4
         self.log_step = 1
         self.is_cuda = torch.cuda.is_available()
+        
+        # CUDA optimization settings
+        if self.is_cuda:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # 清理GPU缓存
+            torch.cuda.empty_cache()
+            
         self.model_save_path = config['log_dir']
         self.batch_size = config['batch_size']
         self.tag_list = tag_list
@@ -73,6 +82,11 @@ class Solver():
             ctr = 0
             step_loss = 0
             epoch_loss = 0
+            
+            # 每个epoch开始时清理GPU缓存
+            if self.is_cuda:
+                torch.cuda.empty_cache()
+                
             for i1, i2 in zip(self.data_loader1, self.data_loader2):
                 ctr += 1
 
@@ -103,6 +117,11 @@ class Solver():
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+
+                # 清理不需要的变量
+                del x, y, att, clf, loss1, loss2, loss
+                if self.is_cuda:
+                    torch.cuda.empty_cache()
 
                 # print log
                 if (ctr) % self.log_step == 0:
@@ -193,31 +212,57 @@ class Solver():
         prd_array = np.array(prd_array)
         gt_array = np.array(gt_array)
 
-        roc_aucs = metrics.roc_auc_score(gt_array, prd_array, average='macro')
-        pr_aucs = metrics.average_precision_score(gt_array, prd_array, average='macro')
+        # 计算每个类别的样本数
+        class_counts = np.sum(gt_array, axis=0)
+        
+        # 找出有正样本的类别
+        valid_classes = np.where(class_counts > 0)[0]
+        
+        if len(valid_classes) == 0:
+            print("Warning: No positive samples found in any class!")
+            return 0.0, 0.0, np.zeros(self.num_class), np.zeros(self.num_class)
+            
+        # 只对有正样本的类别计算AUC
+        roc_aucs = metrics.roc_auc_score(gt_array[:, valid_classes], prd_array[:, valid_classes], average='macro')
+        pr_aucs = metrics.average_precision_score(gt_array[:, valid_classes], prd_array[:, valid_classes], average='macro')
 
         print('roc_auc: %.4f' % roc_aucs)
         print('pr_auc: %.4f' % pr_aucs)
 
-        roc_auc_all = metrics.roc_auc_score(gt_array, prd_array, average=None)
-        pr_auc_all = metrics.average_precision_score(gt_array, prd_array, average=None)
+        # 计算所有类别的AUC，对于没有正样本的类别返回0
+        roc_auc_all = np.zeros(self.num_class)
+        pr_auc_all = np.zeros(self.num_class)
+        
+        for i in range(self.num_class):
+            if class_counts[i] > 0:
+                roc_auc_all[i] = metrics.roc_auc_score(gt_array[:, i], prd_array[:, i])
+                pr_auc_all[i] = metrics.average_precision_score(gt_array[:, i], prd_array[:, i])
 
         if list_all==True:            
             for i in range(self.num_class):
-                print('%s \t\t %.4f , %.4f' % (self.tag_list[i], roc_auc_all[i], pr_auc_all[i]))
+                if class_counts[i] > 0:
+                    print('%s \t\t %.4f , %.4f' % (self.tag_list[i], roc_auc_all[i], pr_auc_all[i]))
+                else:
+                    print('%s \t\t No positive samples' % (self.tag_list[i]))
         
         return roc_aucs, pr_aucs, roc_auc_all, pr_auc_all
 
     def _schedule(self, current_optimizer, drop_counter):
         if current_optimizer == 'adam' and drop_counter == 60:
-            self.load(os.path.join(self.model_save_path, 'best_model.pth'))
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
             self.optimizer = torch.optim.SGD(self.model.parameters(), 0.001, momentum=0.9, weight_decay=0.0001, nesterov=True)
             current_optimizer = 'sgd_1'
             drop_counter = 0
             print('sgd 1e-3')
         # first drop
         if current_optimizer == 'sgd_1' and drop_counter == 20:
-            self.load(os.path.join(self.model_save_path, 'best_model.pth'))
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
             for pg in self.optimizer.param_groups:
                 pg['lr'] = 0.0001
             current_optimizer = 'sgd_2'
@@ -225,7 +270,10 @@ class Solver():
             print('sgd 1e-4')
         # second drop
         if current_optimizer == 'sgd_2' and drop_counter == 20:
-            self.load(os.path.join(self.model_save_path, 'best_model.pth'))
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
             for pg in self.optimizer.param_groups:
                 pg['lr'] = 0.00001
             current_optimizer = 'sgd_3'
