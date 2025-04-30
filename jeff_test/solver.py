@@ -1,396 +1,356 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-训练 / 验证 —— minimal GPU 适配
-"""
-import os, time, datetime, numpy as np, torch, torch.nn as nn
+import os
+import time
+import numpy as np
+import datetime
+import tqdm
 from sklearn import metrics
+import pickle
+import csv
+
+import torch
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-import swanlab
 
 from model import MusicSelfAttModel
+import swanlab
 
-class Solver:
-    def __init__(self, data_loader1, data_loader2,
-                 valid_loader, tag_list, cfg):
-        # 数据
-        self.dl1, self.dl2, self.val = data_loader1, data_loader2, valid_loader
+class Solver():
+    def __init__(self, data_loader1, data_loader2, valid_loader, tag_list, config):
+        # Data loader
+        self.data_loader1 = data_loader1
+        self.data_loader2 = data_loader2
+        self.valid_loader = valid_loader
 
-        # 训练超参
-        self.epochs = 120
-        self.lr     = 1e-7  # 进一步降低学习率
+        # Training settings
+        self.n_epochs = 120
+        self.lr = 1e-4
         self.log_step = 1
-        self.max_grad_norm = 0.05  # 降低梯度裁剪阈值
-        self.grad_clip_val = 0.005  # 降低梯度裁剪值
-        self.nan_threshold = 1e-6
-        self.min_lr = 1e-7
-        self.lr_patience = 3
-        self.grad_accum_steps = 4  # 减少梯度累积步数
-        self.warmup_steps = 1000  # 减少预热步数
-        self.grad_norm_threshold = 0.5  # 降低梯度范数阈值
-        self.loss_scale = 0.001  # 降低损失缩放因子
-        self.grad_scale = 0.01  # 降低梯度缩放因子
-        self.batch_size = 128  # 增加批处理大小
-
-        # 设备
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.is_cuda = torch.cuda.is_available()
         
-        # 启用 CUDA 优化
-        if torch.cuda.is_available():
+        # CUDA optimization settings
+        if self.is_cuda:
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # 设置 CUDA 性能优化
-            torch.cuda.set_per_process_memory_fraction(0.95)  # 允许使用95%的GPU内存
-            torch.cuda.empty_cache()  # 清理GPU缓存
+            # 清理GPU缓存
+            torch.cuda.empty_cache()
             
-            # 设置CUDA流
-            self.stream = torch.cuda.Stream()
-            
-            # 打印GPU信息
-            print(f"使用GPU: {torch.cuda.get_device_name(0)}")
-            print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**2:.1f}MB")
-            print(f"CUDA版本: {torch.version.cuda}")
+        self.model_save_path = config['log_dir']
+        self.batch_size = config['batch_size']
+        self.tag_list = tag_list
+        self.num_class = 56
+        self.writer = SummaryWriter(config['log_dir'])
+        self.model_fn = os.path.join(self.model_save_path, 'best_model.pth')
 
-        # 日志
-        os.makedirs(cfg["log_dir"], exist_ok=True)
-        self.writer = SummaryWriter(cfg["log_dir"])
+        # Build model
+        self.build_model()
 
-        swanlab.init(project="mediaeval2019-moodtheme", name="train-run")
+    def build_model(self):
+        # model and optimizer
+        model = MusicSelfAttModel()
 
-        # 模型
-        self.model = MusicSelfAttModel().to(self.device)
-        
-        # 改进的权重初始化
-        for m in self.model.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                if m.weight is not None:
-                    nn.init.ones_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        # 使用AdamW优化器，添加权重衰减
-        self.opt = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.lr,
-            weight_decay=0.1,  # 增加权重衰减
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        
-        # 使用ReduceLROnPlateau调度器
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.opt,
-            mode='max',
-            factor=0.5,
-            patience=self.lr_patience,
-            min_lr=self.min_lr
-        )
-        
-        self.crit = nn.BCEWithLogitsLoss(reduction='none')
-        
-        # 初始化混合精度训练
-        self.scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
+        if self.is_cuda:
+            self.model = model
+            self.model.cuda()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
 
-    def check_gradients(self):
-        """检查梯度是否在合理范围内"""
-        total_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        return total_norm
+    def load(self, filename):
+        S = torch.load(filename)
+        self.model.load_state_dict(S)
 
-    def scale_gradients(self):
-        """缩放梯度"""
-        for p in self.model.parameters():
-            if p.grad is not None:
-                p.grad.data.mul_(self.grad_scale)
+    def save(self, filename):
+        model = self.model.state_dict()
+        torch.save({'model': model}, filename)
 
-    def compute_loss(self, att, clf, y):
-        """计算损失，添加数值稳定性检查"""
-        # 计算注意力损失
-        att_loss = self.crit(att, y)
-        att_loss = torch.mean(att_loss)
-        
-        # 计算分类损失
-        clf_loss = self.crit(clf, y)
-        clf_loss = torch.mean(clf_loss)
-        
-        # 检查损失值
-        if torch.isnan(att_loss) or torch.isinf(att_loss):
-            att_loss = torch.tensor(0.0, device=self.device)
-        if torch.isnan(clf_loss) or torch.isinf(clf_loss):
-            clf_loss = torch.tensor(0.0, device=self.device)
-            
-        # 组合损失并应用缩放
-        total_loss = 0.5 * (att_loss + clf_loss) * self.loss_scale
-        return total_loss
+    def to_var(self, x):
+        if self.is_cuda:
+            x = x.cuda()
+        return x
 
-    # ---------- 训练 ----------
     def train(self):
-        print("Training on", self.device)
-        best_auc = 0.0
-        start = time.time()
-        nan_count = 0
-        lr_patience_count = 0
-        accumulated_loss = 0.0
+        start_t = time.time()
+        current_optimizer = 'adam'
+        best_roc_auc = 0
+        drop_counter = 0
+        reconst_loss = nn.BCELoss()
 
-        # 添加GPU监控
-        def print_gpu_utilization():
-            if torch.cuda.is_available():
-                print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
-                      f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
-                # 打印GPU利用率
-                try:
-                    import pynvml
-                    pynvml.nvmlInit()
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                    info = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    print(f"GPU利用率: {info.gpu}%, 内存带宽利用率: {info.memory}%")
-                except:
-                    pass
-
-        for ep in range(1, self.epochs + 1):
+        for epoch in range(self.n_epochs):
+            print('Training')
+            drop_counter += 1
+            # train
             self.model.train()
-            running = 0.0
-
-            for step, (batch1, batch2) in enumerate(zip(self.dl1, self.dl2), start=1):
-                current_loss = None  # 初始化current_loss变量
-                try:
-                    # 使用CUDA流进行异步处理
-                    with torch.cuda.stream(self.stream):
-                        # 将数据移到 GPU 并启用异步传输
-                        lam = np.random.beta(1.,1., size=batch1[0].size(0)).astype("float32")
-                        lam_x = torch.from_numpy(lam).view(-1,1,1,1).to(self.device, non_blocking=True)
-                        lam_y = torch.from_numpy(lam).view(-1,1).to(self.device, non_blocking=True)
-
-                        # 预处理输入数据
-                        x1 = batch1[0].to(self.device, non_blocking=True)
-                        x2 = batch2[0].to(self.device, non_blocking=True)
-                        
-                        # 检查输入形状并纠正
-                        # 确保输入是 (B, 1, 96, 1400) 形状
-                        if x1.dim() == 3:  # (B, 96, 1400)
-                            x1 = x1.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
-                        if x2.dim() == 3:  # (B, 96, 1400)
-                            x2 = x2.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
-                        
-                        # 检查通道数是否正确
-                        if x1.size(1) != 1:
-                            print(f"警告: x1 通道数不正确: {x1.size(1)}，调整为 1")
-                            x1 = x1[:, 0:1]  # 只保留第一个通道
-                        if x2.size(1) != 1:
-                            print(f"警告: x2 通道数不正确: {x2.size(1)}，调整为 1")
-                            x2 = x2[:, 0:1]  # 只保留第一个通道
-                        
-                        # 检查并处理无效值
-                        x1 = torch.nan_to_num(x1, nan=0.0, posinf=1.0, neginf=-1.0)
-                        x2 = torch.nan_to_num(x2, nan=0.0, posinf=1.0, neginf=-1.0)
-                        
-                        # 计算混合输入
-                        x = lam_x * x1 + (1-lam_x) * x2
-                        
-                        # 标准化输入
-                        x = (x - x.mean()) / (x.std() + 1e-8)
-                        
-                        # 添加输入值范围限制
-                        x = torch.clamp(x, -3.0, 3.0)
-                        
-                        # 打印最终输入形状用于调试
-                        if step == 1:
-                            print(f"Model input shape: {x.shape}")
-                        
-                        y1 = batch1[1].to(self.device, non_blocking=True)
-                        y2 = batch2[1].to(self.device, non_blocking=True)
-                        y = lam_y * y1 + (1-lam_y) * y2
-
-                        # 使用混合精度训练
-                        with torch.amp.autocast('cuda'):
-                            att, clf = self.model(x)
-                            if att.dim() == 1:
-                                att = att.unsqueeze(1)
-                            if clf.dim() == 1:
-                                clf = clf.unsqueeze(1)
-                            
-                            att = att.expand(-1, 56)
-                            current_loss = self.compute_loss(att, clf, y)
-                            current_loss = current_loss / self.grad_accum_steps
-
-                        # 反向传播
-                        self.scaler.scale(current_loss).backward()
-                        
-                        # 梯度累积
-                        if (step + 1) % self.grad_accum_steps == 0:
-                            # 梯度裁剪
-                            self.scaler.unscale_(self.opt)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
-                            
-                            # 更新参数
-                            self.scaler.step(self.opt)
-                            self.scaler.update()
-                            
-                            # 重置梯度
-                            self.opt.zero_grad(set_to_none=True)
-
-                        # 清理不需要的张量
-                        del x, y, att, clf, lam_x, lam_y, x1, x2, y1, y2
-                        torch.cuda.empty_cache()
-
-                        if current_loss is not None:
-                            running += current_loss.item()
-                            
-                            # 每100步打印一次GPU使用情况
-                            if step % 100 == 0:
-                                print_gpu_utilization()
-                                
-                            # 每log_step步打印一次训练信息
-                            if step % self.log_step == 0:
-                                print(f"Epoch [{ep}/{self.epochs}] Step [{step}/{len(self.dl1)}] "
-                                      f"Loss: {current_loss.item():.4f} "
-                                      f"LR: {self.opt.param_groups[0]['lr']:.2e}")
-                                
-                                # 记录到tensorboard
-                                self.writer.add_scalar('Loss/train', current_loss.item(), 
-                                                     (ep-1)*len(self.dl1) + step)
-                                self.writer.add_scalar('LR', self.opt.param_groups[0]['lr'], 
-                                                     (ep-1)*len(self.dl1) + step)
-                                
-                                # 记录到swanlab
-                                swanlab.log({
-                                    "train_loss": current_loss.item(),
-                                    "learning_rate": self.opt.param_groups[0]['lr']
-                                })
-                                
-                                # 检查梯度
-                                grad_norm = self.check_gradients()
-                                if grad_norm > self.grad_norm_threshold:
-                                    print(f"Warning: Gradient norm ({grad_norm:.4f}) exceeds threshold")
-                                    self.scale_gradients()
-                                    
-                                # 检查NaN
-                                if torch.isnan(current_loss):
-                                    nan_count += 1
-                                    print(f"Warning: NaN loss detected ({nan_count} times)")
-                                    if nan_count >= 3:
-                                        print("Too many NaN losses, stopping training")
-                                        return
-                                        
-                                # 检查学习率
-                                if self.opt.param_groups[0]['lr'] < self.min_lr:
-                                    lr_patience_count += 1
-                                    if lr_patience_count >= self.lr_patience:
-                                        print("Learning rate too small for too long, stopping training")
-                                        return
-                                        
-                                # 累积损失
-                                accumulated_loss += current_loss.item()
-                                
-                                # 每1000步评估一次
-                                if step % 1000 == 0:
-                                    val_auc = self.evaluate()
-                                    self.scheduler.step(val_auc)  # 使用验证集AUC来调整学习率
-
-                except Exception as e:
-                    print(f"Error in step {step}: {str(e)}")
-                    # 清理GPU内存
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-
-            # 等待所有CUDA操作完成
-            torch.cuda.synchronize()
-
-            # ---------- 验证 ----------
-            auc = self.evaluate()
-            print(f"Epoch {ep:03d}  AUC {auc:.4f}")
-            swanlab.log({"val/auc": auc})
-            self.writer.add_scalar("val/auc", auc, ep)
-
-            # 存最好模型
-            if auc > best_auc:
-                best_auc = auc
-                torch.save(self.model.state_dict(), "best_model.pth")
-
-    # ---------- 验证 ----------
-    @torch.no_grad()
-    def evaluate(self):
-        self.model.eval()
-        ys, ps = [], []
-        for x, y in self.val:
-            # 确保输入是 (B, 1, 96, 1400) 形状
-            if x.dim() == 3:  # (B, 96, 1400)
-                x = x.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+            ctr = 0
+            step_loss = 0
+            epoch_loss = 0
             
-            # 检查通道数是否正确
-            if x.size(1) != 1:
-                print(f"警告: 验证数据通道数不正确: {x.size(1)}，调整为 1")
-                x = x[:, 0:1]  # 只保留第一个通道
-            
-            # 检查并处理无效值
-            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            # 标准化输入
-            x = (x - x.mean()) / (x.std() + 1e-8)
-            
-            # 添加输入值范围限制
-            x = torch.clamp(x, -3.0, 3.0)
-            
-            # 将数据移到设备上
-            x = x.to(self.device)
-            
-            # 使用模型进行预测
-            att, clf = self.model(x)
-            ps.append(clf.cpu())
-            ys.append(y)
-        ys, ps = torch.cat(ys).numpy(), torch.cat(ps).numpy()
-        try:
-            return metrics.roc_auc_score(ys, ps, average="macro")
-        except ValueError:
-            return 0.0
+            # 每个epoch开始时清理GPU缓存
+            if self.is_cuda:
+                torch.cuda.empty_cache()
+                
+            for i1, i2 in zip(self.data_loader1, self.data_loader2):
+                ctr += 1
 
-    @torch.no_grad()
-    def test(self):
-        self.model.eval()
-        outputs = []
-        
-        for batch in self.dl1:
-            try:
-                x = batch[0].to(self.device)
+                # mixup---------
+                alpha = 1
+                mixup_vals = np.random.beta(alpha, alpha, i1[0].shape[0])
                 
-                # 检查输入形状并纠正
-                # 确保输入是 (B, 1, 96, 1400) 形状
-                if x.dim() == 3:  # (B, 96, 1400)
-                    x = x.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+                lam = torch.Tensor(mixup_vals.reshape(mixup_vals.shape[0], 1, 1, 1))
+                inputs = (lam * i1[0]) + ((1 - lam) * i2[0])
                 
-                # 检查通道数是否正确
-                if x.size(1) != 1:
-                    print(f"警告: 测试数据通道数不正确: {x.size(1)}，调整为 1")
-                    x = x[:, 0:1]  # 只保留第一个通道
-                
-                # 检查并处理无效值
-                x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
-                
-                # 标准化输入
-                x = (x - x.mean()) / (x.std() + 1e-8)
-                
-                # 添加输入值范围限制
-                x = torch.clamp(x, -3.0, 3.0)
-                
-                with torch.amp.autocast('cuda'):
-                    att, clf = self.model(x)
-                    o = torch.sigmoid(0.5 * (att + clf))
-                    outputs.append(o.cpu().numpy())
-            except Exception as e:
-                print(f"测试时出错: {str(e)}")
-                # 清理GPU内存
-                if torch.cuda.is_available():
+                lam = torch.Tensor(mixup_vals.reshape(mixup_vals.shape[0], 1))
+                labels = (lam * i1[1]) + ((1 - lam) * i2[1])
+
+                # variables to cuda
+                x = self.to_var(inputs)
+                y = self.to_var(labels)
+
+                # predict
+                att,clf = self.model(x)
+                loss1 = reconst_loss(att, y)
+                loss2 = reconst_loss(clf,y)
+                loss = (loss1+loss2)/2
+
+                step_loss += loss.item()
+                epoch_loss += loss.item()
+
+                # back propagation
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                # 清理不需要的变量
+                del x, y, att, clf, loss1, loss2, loss
+                if self.is_cuda:
                     torch.cuda.empty_cache()
-                continue
-                
-        return np.vstack(outputs)
+
+                # print log
+                if (ctr) % self.log_step == 0:
+                    print("[%s] Epoch [%d/%d] Iter [%d/%d] train loss: %.4f Elapsed: %s" %
+                            (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            epoch+1, self.n_epochs, ctr, len(self.data_loader1), (step_loss/self.log_step),
+                            datetime.timedelta(seconds=time.time()-start_t)))
+                    # 记录训练损失到SwanLab
+                    swanlab.log({
+                        "train/loss": step_loss/self.log_step,
+                        "train/epoch": epoch+1,
+                        "train/iteration": ctr
+                    })
+                    step_loss = 0
+
+            # 记录epoch损失到SwanLab
+            swanlab.log({
+                "train/epoch_loss": epoch_loss/len(self.data_loader1),
+                "train/epoch": epoch+1
+            })
+
+            # validation
+            roc_auc, pr_auc = self._validation(start_t, epoch)
+
+            # 记录验证指标到SwanLab
+            swanlab.log({
+                "val/roc_auc": roc_auc,
+                "val/pr_auc": pr_auc,
+                "val/epoch": epoch+1
+            })
+
+            # save model
+            if roc_auc > best_roc_auc:
+                print('best model: %4f' % roc_auc)
+                best_roc_auc = roc_auc
+                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, 'best_model.pth'))
+                # 记录最佳模型指标
+                swanlab.log({
+                    "best/roc_auc": best_roc_auc,
+                    "best/epoch": epoch+1
+                })
+
+            if epoch%10 ==0:
+                print(f'Saving model at epoch {epoch}')
+                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, f'model_epoch_{epoch}.pth'))
+
+            # schedule optimizer
+            current_optimizer, drop_counter = self._schedule(current_optimizer, drop_counter)
+
+        print("[%s] Train finished. Elapsed: %s"
+                % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    datetime.timedelta(seconds=time.time() - start_t)))
+        
+        return best_roc_auc, pr_auc
+
+    def _validation(self, start_t, epoch):
+        prd1_array = []  # prediction
+        prd2_array = []
+        gt_array = []   # ground truth
+        ctr = 0
+        self.model.eval()
+        reconst_loss = nn.BCELoss()
+        for x, y in self.valid_loader:
+            ctr += 1
+
+            # variables to cuda
+            x = self.to_var(x)
+            y = self.to_var(y)
+
+            # predict
+            att,clf = self.model(x)
+            loss1 = reconst_loss(att, y)
+            loss2 = reconst_loss(clf,y)
+            loss = (loss1+loss2)/2
+
+            # print log
+            if (ctr) % self.log_step == 0:
+                print("[%s] Epoch [%d/%d], Iter [%d/%d] valid loss: %.4f Elapsed: %s" %
+                        (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        epoch+1, self.n_epochs, ctr, len(self.valid_loader), loss.item(),
+                        datetime.timedelta(seconds=time.time()-start_t)))
+
+            # append prediction
+            att = att.detach().cpu()
+            clf = clf.detach().cpu()
+            y = y.detach().cpu()
+            for prd1 in att:
+                prd1_array.append(list(np.array(prd1)))
+            for prd2 in clf:
+                prd2_array.append(list(np.array(prd2)))
+            for gt in y:
+                gt_array.append(list(np.array(gt)))
+
+        val_loss1 = reconst_loss(torch.Tensor(prd1_array), torch.Tensor(gt_array))
+        val_loss2 = reconst_loss(torch.Tensor(prd2_array), torch.Tensor(gt_array))
+        print(f'Val Loss: {val_loss1}, {val_loss2}')
+        self.writer.add_scalar('Loss/val1', val_loss1, epoch)
+        self.writer.add_scalar('Loss/val2', val_loss2, epoch)
+
+        # get auc
+        list_all = True if epoch==self.n_epochs else False
+
+        roc_auc1, pr_auc1, _, _ = self.get_auc(prd1_array, gt_array, list_all)
+        roc_auc2, pr_auc2, _, _ = self.get_auc(prd2_array, gt_array, list_all)
+        self.writer.add_scalar('AUC/ROC2', roc_auc1, epoch)
+        self.writer.add_scalar('AUC/PR2', pr_auc1, epoch)
+        self.writer.add_scalar('AUC/ROC2', roc_auc2, epoch)
+        self.writer.add_scalar('AUC/PR2', pr_auc2, epoch)
+        return roc_auc1, pr_auc1
+
+    def get_auc(self, prd_array, gt_array, list_all=False):
+        prd_array = np.array(prd_array)
+        gt_array = np.array(gt_array)
+
+        # 计算每个类别的样本数
+        class_counts = np.sum(gt_array, axis=0)
+        
+        # 找出有正样本的类别
+        valid_classes = np.where(class_counts > 0)[0]
+        
+        if len(valid_classes) == 0:
+            print("Warning: No positive samples found in any class!")
+            return 0.0, 0.0, np.zeros(self.num_class), np.zeros(self.num_class)
+            
+        # 只对有正样本的类别计算AUC
+        roc_aucs = metrics.roc_auc_score(gt_array[:, valid_classes], prd_array[:, valid_classes], average='macro')
+        pr_aucs = metrics.average_precision_score(gt_array[:, valid_classes], prd_array[:, valid_classes], average='macro')
+
+        print('roc_auc: %.4f' % roc_aucs)
+        print('pr_auc: %.4f' % pr_aucs)
+
+        # 计算所有类别的AUC，对于没有正样本的类别返回0
+        roc_auc_all = np.zeros(self.num_class)
+        pr_auc_all = np.zeros(self.num_class)
+        
+        for i in range(self.num_class):
+            if class_counts[i] > 0:
+                roc_auc_all[i] = metrics.roc_auc_score(gt_array[:, i], prd_array[:, i])
+                pr_auc_all[i] = metrics.average_precision_score(gt_array[:, i], prd_array[:, i])
+
+        if list_all==True:            
+            for i in range(self.num_class):
+                if class_counts[i] > 0:
+                    print('%s \t\t %.4f , %.4f' % (self.tag_list[i], roc_auc_all[i], pr_auc_all[i]))
+                else:
+                    print('%s \t\t No positive samples' % (self.tag_list[i]))
+        
+        return roc_aucs, pr_aucs, roc_auc_all, pr_auc_all
+
+    def _schedule(self, current_optimizer, drop_counter):
+        if current_optimizer == 'adam' and drop_counter == 60:
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
+            self.optimizer = torch.optim.SGD(self.model.parameters(), 0.001, momentum=0.9, weight_decay=0.0001, nesterov=True)
+            current_optimizer = 'sgd_1'
+            drop_counter = 0
+            print('sgd 1e-3')
+        # first drop
+        if current_optimizer == 'sgd_1' and drop_counter == 20:
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = 0.0001
+            current_optimizer = 'sgd_2'
+            drop_counter = 0
+            print('sgd 1e-4')
+        # second drop
+        if current_optimizer == 'sgd_2' and drop_counter == 20:
+            # 检查文件是否存在
+            best_model_path = os.path.join(self.model_save_path, 'best_model.pth')
+            if os.path.exists(best_model_path):
+                self.load(best_model_path)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = 0.00001
+            current_optimizer = 'sgd_3'
+            print('sgd 1e-5')
+        return current_optimizer, drop_counter
+
+    def test(self):
+        start_t = time.time()
+        reconst_loss = nn.BCELoss()
+        epoch = 0
+
+        self.load(self.model_fn)
+        self.model.eval()
+        ctr = 0
+        prd_array = []  # prediction
+        gt_array = []   # ground truth
+        for x, y in self.data_loader1:
+            ctr += 1
+
+            # variables to cuda
+            x = self.to_var(x)
+            y = self.to_var(y)
+
+            # predict
+            out1, out2 = self.model(x)
+            out = (out1+out2)/2
+            loss = reconst_loss(out, y)
+
+            # print log
+            if (ctr) % self.log_step == 0:
+                print("[%s] Iter [%d/%d] test loss: %.4f Elapsed: %s" %
+                        (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        ctr, len(self.data_loader1), loss.item(),
+                        datetime.timedelta(seconds=time.time()-start_t)))
+
+            # append prediction
+            out = out.detach().cpu()
+            y = y.detach().cpu()
+            for prd in out:
+                prd_array.append(list(np.array(prd)))
+            for gt in y:
+                gt_array.append(list(np.array(gt)))
+
+        #np.save('./pred_array.npy', np.array(prd_array))
+        #np.save('./gt_array.npy', np.array(gt_array))
+
+        # get auc
+        roc_auc, pr_auc, roc_auc_all, pr_auc_all = self.get_auc(prd_array, gt_array)
+
+        return (np.array(prd_array), np.array(gt_array), roc_auc, pr_auc)
+
+        # save aucs
+        #np.save(open(self.roc_auc_fn, 'wb'), roc_auc_all)
+        #np.save(open(self.pr_auc_fn, 'wb'), pr_auc_all)
+

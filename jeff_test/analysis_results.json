@@ -1,0 +1,60 @@
+[
+  {
+    "filename": "刘德华-冰雨.mp3",
+    "song_name": "刘德华",
+    "artist": "冰雨",
+    "model_predictions": [
+      "mood/theme---love",
+      "mood/theme---sexy",
+      "mood/theme---melancholic",
+      "mood/theme---road-trip",
+      "mood/theme---fusion"
+    ],
+    "model_predictions_indices": [
+      31,
+      44,
+      33,
+      41,
+      21
+    ],
+    "online_tags": [],
+    "model_predictions_chinese": [
+      "爱情",
+      "性感",
+      "忧郁",
+      "公路旅行",
+      "融合"
+    ]
+  },
+  {
+    "filename": "金海心-那么骄傲.mp3",
+    "song_name": "金海心",
+    "artist": "那么骄傲",
+    "model_predictions": [
+      "mood/theme---love",
+      "mood/theme---film",
+      "mood/theme---fusion",
+      "mood/theme---commercial",
+      "mood/theme---sexy"
+    ],
+    "model_predictions_indices": [
+      31,
+      19,
+      21,
+      7,
+      44
+    ],
+    "online_tags": [
+      "mood/theme---emotional",
+      "mood/theme---dreamy",
+      "mood/theme---melancholic"
+    ],
+    "model_predictions_chinese": [
+      "爱情",
+      "电影",
+      "融合",
+      "商业",
+      "性感"
+    ]
+  }
+]

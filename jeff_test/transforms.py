@@ -3,13 +3,10 @@ import torch
 import random
 import librosa
 import numpy as np
-from PIL import Image
+
 from random_resized_crop import RandomResizedCrop
 
 cv2.setNumThreads(0)
-
-# 添加 GPU 设备
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def image_crop(image, bbox):
@@ -59,22 +56,12 @@ class SpecAugment:
         self.freq_masking = freq_masking
         self.time_masking = time_masking
 
-    def __call__(self, spec):
-        # 在 GPU 上执行 SpecAugment
-        spec = spec.clone()
-        num_mask = random.randint(1, self.num_mask)
-        for i in range(num_mask):
-            all_freqs_num, all_frames_num = spec.shape
-            freq_percentage = random.uniform(0.0, self.freq_masking)
-            num_freqs_to_mask = int(freq_percentage * all_freqs_num)
-            f0 = random.randint(0, all_freqs_num - num_freqs_to_mask)
-            spec[f0:f0 + num_freqs_to_mask, :] = spec.min()
-
-            time_percentage = random.uniform(0.0, self.time_masking)
-            num_frames_to_mask = int(time_percentage * all_frames_num)
-            t0 = random.randint(0, all_frames_num - num_frames_to_mask)
-            spec[:, t0:t0 + num_frames_to_mask] = spec.min()
-        return spec
+    def __call__(self, image):
+        return spec_augment(image,
+                            self.num_mask,
+                            self.freq_masking,
+                            self.time_masking,
+                            image.min())
 
 
 class Compose:
@@ -172,19 +159,14 @@ class RandomGaussianBlur:
 
 
 class ImageToTensor:
-    def __call__(self, tensor):
-        # 确保数据在 GPU 上并归一化
-        if not isinstance(tensor, torch.Tensor):
-            tensor = torch.from_numpy(tensor).float()
-            
-        # 确保是3D的 (1, N_MELS, T)
-        if len(tensor.shape) == 2:  # (N_MELS, T)
-            tensor = tensor.unsqueeze(0)  # 添加通道维度 -> (1, N_MELS, T)
-        elif len(tensor.shape) == 3 and tensor.shape[0] != 1:
-            # 如果已经是3D但第一维不是1，则需要调整
-            tensor = tensor.unsqueeze(0) if tensor.shape[0] == 96 else tensor[0:1]
-            
-        return tensor.to(DEVICE)
+    def __call__(self, image):
+        #delta = librosa.feature.delta(image)
+        #accelerate = librosa.feature.delta(image, order=2)
+        #image = np.stack([image, delta, accelerate], axis=0)
+        image = image[None, :, :]
+        image = image.astype(np.float32) / 100
+        image = torch.from_numpy(image)
+        return image
 
 
 class RandomCrop:
@@ -192,9 +174,8 @@ class RandomCrop:
         self.size = size
 
     def __call__(self, signal):
-        # 在 GPU 上执行随机裁剪
         start = random.randint(0, signal.shape[1] - self.size)
-        return signal[:, start:start + self.size]
+        return signal[:, start: start + self.size]
 
 
 class CenterCrop:
@@ -202,11 +183,12 @@ class CenterCrop:
         self.size = size
 
     def __call__(self, signal):
-        # 在 GPU 上执行中心裁剪
+
         if signal.shape[1] > self.size:
             start = (signal.shape[1] - self.size) // 2
-            return signal[:, start:start + self.size]
-        return signal
+            return signal[:, start: start + self.size]
+        else:
+            return signal
 
 
 class PadToSize:
@@ -216,17 +198,15 @@ class PadToSize:
         self.mode = mode
 
     def __call__(self, signal):
-        # 在 GPU 上执行填充
         if signal.shape[1] < self.size:
             padding = self.size - signal.shape[1]
             offset = padding // 2
+            pad_width = ((0, 0), (offset, padding - offset))
             if self.mode == 'constant':
-                pad_left = torch.full((signal.shape[0], offset), signal.min(), device=signal.device)
-                pad_right = torch.full((signal.shape[0], padding - offset), signal.min(), device=signal.device)
-            else:  # wrap mode
-                pad_left = signal[:, -offset:]
-                pad_right = signal[:, :(padding - offset)]
-            signal = torch.cat([pad_left, signal, pad_right], dim=1)
+                signal = np.pad(signal, pad_width,
+                                'constant', constant_values=signal.min())
+            else:
+                signal = np.pad(signal, pad_width, 'wrap')
         return signal
 
 
@@ -247,7 +227,7 @@ def get_transforms(train, size,
             ], p=[wrap_pad_prob, 1 - wrap_pad_prob]),
             RandomCrop(size),
             UseWithProb(
-                RandomResizedCrop(size=size, scale=resize_scale, ratio=resize_ratio),
+                RandomResizedCrop(scale=resize_scale, ratio=resize_ratio),
                 prob=resize_prob
             ),
             UseWithProb(SpecAugment(num_mask=spec_num_mask,

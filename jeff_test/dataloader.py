@@ -1,152 +1,112 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-从 mp3 直接生成 Mel-Spectrogram：
-    • 解码 / 重采样 —— CPU
-    • Mel + log          —— GPU (若可用)
-返回：audio  (1, 96, 1400)  float32
-        label  (56,)      float32
-"""
-import os, csv, torch, torchaudio, numpy as np
-from torch.utils.data import Dataset, DataLoader
-import torchaudio.transforms as T
+import os
+import csv
+import numpy as np
+import torch
+from torch.utils import data
+import librosa
 from transforms import get_transforms
-import torch.nn.functional as F
 
-TARGET_LEN = 1400                    # time 轴固定长度
-N_MELS     = 96
+def get_spectrogram(full_spect, size=1400):
+    full_len = full_spect.shape[1]
+    if full_len > size:
+        audio = full_spect[:, :size]
+    else:
+        diff = size - full_len
+        audio = full_spect
+        while diff > 0:
+            if diff > full_len:
+                audio = np.concatenate((audio, full_spect), axis=1)
+                diff -= full_len
+            else:
+                audio = np.concatenate((audio, full_spect[:, :diff]), axis=1)
+                diff = 0
+    return audio
 
-# GPU 上预生成 Mel（FFT 非常快）
-MEL_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MEL = T.MelSpectrogram(
-    sample_rate=22050,
-    n_fft=1024,
-    hop_length=512,
-    n_mels=N_MELS
-).to(MEL_DEVICE)
-
-def pad_or_repeat(mel: np.ndarray, length: int = TARGET_LEN) -> np.ndarray:
-    if mel.shape[1] >= length:
-        return mel[:, :length]
-    rep = length // mel.shape[1] + 1
-    return np.tile(mel, (1, rep))[:, :length]
-
-class AudioFolder(Dataset):
-    def __init__(self, root, tsv_path, lab2idx,
-                 num_cls: int = 56, train: bool = True):
+class AudioFolder(data.Dataset):
+    def __init__(self, root, tsv_path, labels_to_idx, num_classes=56, spect_len=4096, train=True):
+        self.train = train
         self.root = root
-        self.num_cls = num_cls
-
-        # 预加载所有标签到 CPU
-        self.paths, self.labels = [], []
-        with open(tsv_path) as f:
-            reader = csv.reader(f, delimiter="\t")
-            next(reader)                # 跳 header
-            for row in reader:
-                path = row[3]
-                # 检查文件是否在允许的目录中（00-16，不包含07）
-                dir_prefix = path.split('/')[0]
-                try:
-                    dir_num = int(dir_prefix)
-                    if 0 <= dir_num <= 16 and dir_num != 7:
-                        self.paths.append(path)
-                        tag_str = row[5].replace('---', ',')
-                        y = np.zeros(num_cls, np.float32)
-                        for t in tag_str.split(','):
-                            t = t.strip()
-                            if t and t in lab2idx:
-                                y[lab2idx[t]] = 1.
-                        self.labels.append(y)
-                except ValueError:
-                    continue  # 跳过无效的目录名
-        
-        # 将标签转换为 CPU tensor
-        self.labels = torch.from_numpy(np.array(self.labels))
+        self.num_classes = num_classes
+        self.spect_len = spect_len
+        self.labels_to_idx = labels_to_idx
+        self.prepare_data(tsv_path)
 
         self.transform = get_transforms(
             train=train,
-            size=TARGET_LEN,
-            wrap_pad_prob=0.5,
-            resize_scale=(0.8,1.0),
-            resize_ratio=(1.7,2.3),
-            resize_prob=0.33,
-            spec_num_mask=2,
-            spec_freq_masking=0.15,
-            spec_time_masking=0.20,
-            spec_prob=0.5
-        ) if train else get_transforms(False, TARGET_LEN)
+            size=spect_len,
+            wrap_pad_prob=0.5 if train else 0.0,
+            resize_scale=(0.8, 1.0) if train else (1.0, 1.0),
+            resize_ratio=(1.7, 2.3) if train else (2.0, 2.0),
+            resize_prob=0.33 if train else 0.0,
+            spec_num_mask=2 if train else 0,
+            spec_freq_masking=0.15 if train else 0.0,
+            spec_time_masking=0.20 if train else 0.0,
+            spec_prob=0.5 if train else 0.0
+        )
 
-    def __len__(self): return len(self.paths)
-
-    def __getitem__(self, idx):
-        max_retries = 5
-        current_idx = idx
+    def __getitem__(self, index):
+        # 读取 mp3 文件
+        fn = os.path.join(self.root, self.paths[index])
+        try:
+            y, sr = librosa.load(fn, sr=16000, mono=True, duration=60)  # 采样率 16k，限制最多 60秒
+        except Exception as e:
+            print(f"Error loading file {fn}: {str(e)}")
+            # Return a zero tensor with the same shape as expected
+            y = np.zeros(16000 * 60)  # 60 seconds of silence at 16kHz
+            sr = 16000
+    
+        # 提取 log-mel 特征
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+        log_mel_spec = librosa.power_to_db(mel_spec)
+    
+        # 不要 expand_dims
+        full_spect = log_mel_spec  # (freq, time)
+    
+        # 适配网络要求的大小
+        audio = get_spectrogram(full_spect, self.spect_len)  # get_spectrogram 默认已经是 (freq, time)
         
-        for _ in range(max_retries):
-            try:
-                fp = os.path.join(self.root, self.paths[current_idx])
-                if not os.path.exists(fp):
-                    print(f"File does not exist: {fp}")
-                    # Try the next file
-                    current_idx = (current_idx + 1) % len(self)
-                    continue
-                wav, sr = torchaudio.load(fp)               # 解码 (CPU)
-
-                if sr != 22050:
-                    wav = T.Resample(sr, 22050)(wav)
-                wav = wav.mean(0, keepdim=True)
-
-                # 将数据移到与MEL相同的设备上
-                wav = wav.to(MEL_DEVICE)
-                
-                # 生成 mel spectrogram
-                mel = MEL(wav).log()
-                mel = mel.squeeze(0)
-                
-                # 在 GPU 上进行 padding
-                if mel.shape[1] >= TARGET_LEN:
-                    mel = mel[:, :TARGET_LEN]
-                else:
-                    rep = TARGET_LEN // mel.shape[1] + 1
-                    mel = torch.tile(mel, (1, rep))[:, :TARGET_LEN]
-                
-                # 应用数据增强
-                mel = self.transform(mel)
-                
-                # 确保输出大小一致
-                if mel.shape[0] != N_MELS:
-                    mel = mel.unsqueeze(0)
-                    mel = F.interpolate(
-                        mel,
-                        size=(N_MELS, TARGET_LEN),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)
-                
-                # 将数据移回 CPU
-                mel = mel.cpu()
-                
-                return mel, self.labels[current_idx]
-                
-            except Exception as e:
-                print(f"Error loading file {fp}: {str(e)}")
-                # 尝试下一个文件
-                current_idx = (current_idx + 1) % len(self)
+        # 这里 self.transform 要求输入 2D，如果 transform 里面需要 Image.fromarray，要确保是 (H, W)，而不是 (1, H, W)
+        audio = self.transform(audio)
+    
+        # 之后返回 audio + labels
+        tags = self.tags[index]
+        labels = self.one_hot(tags)
+        return audio, labels
         
-        # 如果所有重试都失败，返回一个空的 mel spectrogram
-        print(f"Warning: Failed to load audio after {max_retries} attempts, returning zero tensor")
-        return torch.zeros((N_MELS, TARGET_LEN)), self.labels[current_idx]
+    
+    def __len__(self):
+        return len(self.paths)
 
-def get_audio_loader(root, tsv, lab2idx,
-                     batch_size=16, num_workers=1,  # 减少到1个worker
-                     shuffle=True, drop_last=True):
-    ds = AudioFolder(root, tsv, lab2idx, train=shuffle)
-    return DataLoader(ds,
-                      batch_size=batch_size,
-                      shuffle=shuffle,
-                      num_workers=num_workers,
-                      pin_memory=True,
-                      drop_last=drop_last,
-                      persistent_workers=True,
-                      prefetch_factor=1,  # 减少预加载批次
-                      multiprocessing_context='spawn')
+    def one_hot(self, tags):
+        labels = torch.LongTensor(tags)
+        target = torch.zeros(self.num_classes).scatter_(0, labels, 1)
+        return target
+
+    def prepare_data(self, path_to_tsv):
+        all_dict = {
+            'PATH': [],
+            'TAGS': []
+        }
+        with open(path_to_tsv) as tsvfile:
+            tsvreader = csv.reader(tsvfile, delimiter="\t")
+            next(tsvreader)  # 跳过表头
+            for line in tsvreader:
+                all_dict['PATH'].append(line[3])  # mp3路径列
+                all_dict['TAGS'].append(line[5:]) # 标签列
+
+        self.paths = all_dict['PATH']
+        self.tags = [[self.labels_to_idx[j] for j in i] for i in all_dict['TAGS']]
+
+def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=32, num_workers=8, shuffle=True, drop_last=True, train=True):
+    dataset = AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=train)
+    loader = data.DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=drop_last,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+    return loader
