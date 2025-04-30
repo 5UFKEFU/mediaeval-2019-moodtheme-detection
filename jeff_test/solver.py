@@ -25,11 +25,12 @@ class Solver:
         self.nan_threshold = 1e-6
         self.min_lr = 1e-7
         self.lr_patience = 3
-        self.grad_accum_steps = 64  # 增加梯度累积步数
-        self.warmup_steps = 2000  # 增加预热步数
+        self.grad_accum_steps = 4  # 减少梯度累积步数
+        self.warmup_steps = 1000  # 减少预热步数
         self.grad_norm_threshold = 0.5  # 降低梯度范数阈值
         self.loss_scale = 0.001  # 降低损失缩放因子
         self.grad_scale = 0.01  # 降低梯度缩放因子
+        self.batch_size = 128  # 增加批处理大小
 
         # 设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,6 +40,17 @@ class Solver:
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            # 设置 CUDA 性能优化
+            torch.cuda.set_per_process_memory_fraction(0.95)  # 允许使用95%的GPU内存
+            torch.cuda.empty_cache()  # 清理GPU缓存
+            
+            # 设置CUDA流
+            self.stream = torch.cuda.Stream()
+            
+            # 打印GPU信息
+            print(f"使用GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**2:.1f}MB")
+            print(f"CUDA版本: {torch.version.cuda}")
 
         # 日志
         os.makedirs(cfg["log_dir"], exist_ok=True)
@@ -70,15 +82,13 @@ class Solver:
             eps=1e-8
         )
         
-        # 添加学习率调度器
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        # 使用ReduceLROnPlateau调度器
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.opt,
-            max_lr=self.lr,
-            epochs=self.epochs,
-            steps_per_epoch=len(self.dl1),
-            pct_start=0.3,
-            div_factor=25.0,
-            final_div_factor=1e4
+            mode='max',
+            factor=0.5,
+            patience=self.lr_patience,
+            min_lr=self.min_lr
         )
         
         self.crit = nn.BCEWithLogitsLoss(reduction='none')
@@ -131,142 +141,170 @@ class Solver:
         lr_patience_count = 0
         accumulated_loss = 0.0
 
+        # 添加GPU监控
+        def print_gpu_utilization():
+            if torch.cuda.is_available():
+                print(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB allocated, "
+                      f"{torch.cuda.memory_reserved() / 1024**2:.1f}MB reserved")
+                # 打印GPU利用率
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    info = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    print(f"GPU利用率: {info.gpu}%, 内存带宽利用率: {info.memory}%")
+                except:
+                    pass
+
         for ep in range(1, self.epochs + 1):
             self.model.train()
             running = 0.0
 
             for step, (batch1, batch2) in enumerate(zip(self.dl1, self.dl2), start=1):
-                # 清理缓存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                # 将数据移到 GPU 并启用异步传输
-                lam = np.random.beta(1.,1., size=batch1[0].size(0)).astype("float32")
-                lam_x = torch.from_numpy(lam).view(-1,1,1,1).to(self.device, non_blocking=True)
-                lam_y = torch.from_numpy(lam).view(-1,1).to(self.device, non_blocking=True)
+                current_loss = None  # 初始化current_loss变量
+                try:
+                    # 使用CUDA流进行异步处理
+                    with torch.cuda.stream(self.stream):
+                        # 将数据移到 GPU 并启用异步传输
+                        lam = np.random.beta(1.,1., size=batch1[0].size(0)).astype("float32")
+                        lam_x = torch.from_numpy(lam).view(-1,1,1,1).to(self.device, non_blocking=True)
+                        lam_y = torch.from_numpy(lam).view(-1,1).to(self.device, non_blocking=True)
 
-                # 预处理输入数据
-                x1 = batch1[0].to(self.device, non_blocking=True)
-                x2 = batch2[0].to(self.device, non_blocking=True)
-                
-                # 检查并处理无效值
-                x1 = torch.nan_to_num(x1, nan=0.0, posinf=1.0, neginf=-1.0)
-                x2 = torch.nan_to_num(x2, nan=0.0, posinf=1.0, neginf=-1.0)
-                
-                # 计算混合输入
-                x = lam_x * x1 + (1-lam_x) * x2
-                
-                # 标准化输入
-                x = (x - x.mean()) / (x.std() + 1e-8)
-                
-                # 添加输入值范围限制
-                x = torch.clamp(x, -3.0, 3.0)  # 更严格的范围限制
-                
-                y1 = batch1[1].to(self.device, non_blocking=True)
-                y2 = batch2[1].to(self.device, non_blocking=True)
-                y = lam_y * y1 + (1-lam_y) * y2
+                        # 预处理输入数据
+                        x1 = batch1[0].to(self.device, non_blocking=True)
+                        x2 = batch2[0].to(self.device, non_blocking=True)
+                        
+                        # 检查输入形状并纠正
+                        # 确保输入是 (B, 1, 96, 1400) 形状
+                        if x1.dim() == 3:  # (B, 96, 1400)
+                            x1 = x1.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+                        if x2.dim() == 3:  # (B, 96, 1400)
+                            x2 = x2.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+                        
+                        # 检查通道数是否正确
+                        if x1.size(1) != 1:
+                            print(f"警告: x1 通道数不正确: {x1.size(1)}，调整为 1")
+                            x1 = x1[:, 0:1]  # 只保留第一个通道
+                        if x2.size(1) != 1:
+                            print(f"警告: x2 通道数不正确: {x2.size(1)}，调整为 1")
+                            x2 = x2[:, 0:1]  # 只保留第一个通道
+                        
+                        # 检查并处理无效值
+                        x1 = torch.nan_to_num(x1, nan=0.0, posinf=1.0, neginf=-1.0)
+                        x2 = torch.nan_to_num(x2, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
+                        # 计算混合输入
+                        x = lam_x * x1 + (1-lam_x) * x2
+                        
+                        # 标准化输入
+                        x = (x - x.mean()) / (x.std() + 1e-8)
+                        
+                        # 添加输入值范围限制
+                        x = torch.clamp(x, -3.0, 3.0)
+                        
+                        # 打印最终输入形状用于调试
+                        if step == 1:
+                            print(f"Model input shape: {x.shape}")
+                        
+                        y1 = batch1[1].to(self.device, non_blocking=True)
+                        y2 = batch2[1].to(self.device, non_blocking=True)
+                        y = lam_y * y1 + (1-lam_y) * y2
 
-                # 检查输入数据
-                if torch.isnan(x).any() or torch.isinf(x).any():
-                    print(f"Warning: NaN/Inf in input data at step {step}")
+                        # 使用混合精度训练
+                        with torch.amp.autocast('cuda'):
+                            att, clf = self.model(x)
+                            if att.dim() == 1:
+                                att = att.unsqueeze(1)
+                            if clf.dim() == 1:
+                                clf = clf.unsqueeze(1)
+                            
+                            att = att.expand(-1, 56)
+                            current_loss = self.compute_loss(att, clf, y)
+                            current_loss = current_loss / self.grad_accum_steps
+
+                        # 反向传播
+                        self.scaler.scale(current_loss).backward()
+                        
+                        # 梯度累积
+                        if (step + 1) % self.grad_accum_steps == 0:
+                            # 梯度裁剪
+                            self.scaler.unscale_(self.opt)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
+                            
+                            # 更新参数
+                            self.scaler.step(self.opt)
+                            self.scaler.update()
+                            
+                            # 重置梯度
+                            self.opt.zero_grad(set_to_none=True)
+
+                        # 清理不需要的张量
+                        del x, y, att, clf, lam_x, lam_y, x1, x2, y1, y2
+                        torch.cuda.empty_cache()
+
+                        if current_loss is not None:
+                            running += current_loss.item()
+                            
+                            # 每100步打印一次GPU使用情况
+                            if step % 100 == 0:
+                                print_gpu_utilization()
+                                
+                            # 每log_step步打印一次训练信息
+                            if step % self.log_step == 0:
+                                print(f"Epoch [{ep}/{self.epochs}] Step [{step}/{len(self.dl1)}] "
+                                      f"Loss: {current_loss.item():.4f} "
+                                      f"LR: {self.opt.param_groups[0]['lr']:.2e}")
+                                
+                                # 记录到tensorboard
+                                self.writer.add_scalar('Loss/train', current_loss.item(), 
+                                                     (ep-1)*len(self.dl1) + step)
+                                self.writer.add_scalar('LR', self.opt.param_groups[0]['lr'], 
+                                                     (ep-1)*len(self.dl1) + step)
+                                
+                                # 记录到swanlab
+                                swanlab.log({
+                                    "train_loss": current_loss.item(),
+                                    "learning_rate": self.opt.param_groups[0]['lr']
+                                })
+                                
+                                # 检查梯度
+                                grad_norm = self.check_gradients()
+                                if grad_norm > self.grad_norm_threshold:
+                                    print(f"Warning: Gradient norm ({grad_norm:.4f}) exceeds threshold")
+                                    self.scale_gradients()
+                                    
+                                # 检查NaN
+                                if torch.isnan(current_loss):
+                                    nan_count += 1
+                                    print(f"Warning: NaN loss detected ({nan_count} times)")
+                                    if nan_count >= 3:
+                                        print("Too many NaN losses, stopping training")
+                                        return
+                                        
+                                # 检查学习率
+                                if self.opt.param_groups[0]['lr'] < self.min_lr:
+                                    lr_patience_count += 1
+                                    if lr_patience_count >= self.lr_patience:
+                                        print("Learning rate too small for too long, stopping training")
+                                        return
+                                        
+                                # 累积损失
+                                accumulated_loss += current_loss.item()
+                                
+                                # 每1000步评估一次
+                                if step % 1000 == 0:
+                                    val_auc = self.evaluate()
+                                    self.scheduler.step(val_auc)  # 使用验证集AUC来调整学习率
+
+                except Exception as e:
+                    print(f"Error in step {step}: {str(e)}")
+                    # 清理GPU内存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     continue
 
-                # 使用新的混合精度训练API
-                with torch.amp.autocast('cuda'):
-                    att, clf = self.model(x)
-                    if step % 50 == 0:
-                        print(f"att shape: {att.shape}, clf shape: {clf.shape}, y shape: {y.shape}")
-                    
-                    if att.dim() == 1:
-                        att = att.unsqueeze(1)
-                    if clf.dim() == 1:
-                        clf = clf.unsqueeze(1)
-                    
-                    att = att.expand(-1, 56)
-                    loss = self.compute_loss(att, clf, y)
-                    loss = loss / self.grad_accum_steps  # 缩放损失
-
-                # 检查loss是否为nan
-                if torch.isnan(loss) or torch.isinf(loss):
-                    nan_count += 1
-                    print(f"Warning: NaN/Inf loss detected at step {step}, count: {nan_count}")
-                    if nan_count > 5:
-                        lr_patience_count += 1
-                        if lr_patience_count >= self.lr_patience:
-                            print("Too many NaN losses, reducing learning rate...")
-                            for param_group in self.opt.param_groups:
-                                new_lr = param_group['lr'] * 0.5
-                                if new_lr >= self.min_lr:
-                                    param_group['lr'] = new_lr
-                                    print(f"Learning rate reduced to {new_lr}")
-                                else:
-                                    print("Learning rate already at minimum")
-                            lr_patience_count = 0
-                        nan_count = 0
-                    continue
-
-                # 保存loss值
-                loss_value = loss.item() * self.grad_accum_steps  # 恢复原始scale
-                accumulated_loss += loss_value
-
-                # 反向传播
-                self.scaler.scale(loss).backward()
-                
-                # 检查梯度是否为nan
-                has_nan_grad = False
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None:
-                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                            print(f"Warning: NaN/Inf gradient in {name}")
-                            param.grad.data.zero_()
-                            has_nan_grad = True
-                
-                if has_nan_grad:
-                    print("Skipping batch due to NaN gradients")
-                    self.opt.zero_grad(set_to_none=True)
-                    continue
-
-                # 梯度累积
-                if (step + 1) % self.grad_accum_steps == 0:
-                    # 检查梯度范数
-                    grad_norm = self.check_gradients()
-                    if grad_norm > self.grad_norm_threshold:
-                        print(f"Warning: Gradient norm {grad_norm:.2f} exceeds threshold {self.grad_norm_threshold}")
-                        self.opt.zero_grad(set_to_none=True)
-                        continue
-                    
-                    # 缩放梯度
-                    self.scale_gradients()
-                    
-                    # 梯度裁剪
-                    self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
-                    
-                    # 更新参数
-                    self.scaler.step(self.opt)
-                    self.scaler.update()
-                    
-                    # 更新学习率
-                    self.scheduler.step()
-                    
-                    # 重置梯度
-                    self.opt.zero_grad(set_to_none=True)
-
-                # 清理不需要的张量
-                del x, y, att, clf, loss, lam_x, lam_y, x1, x2, y1, y2
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                running += loss_value
-
-                if step % self.log_step == 0:
-                    elapsed = str(datetime.timedelta(seconds=int(time.time()-start)))
-                    print(f"[{ep:03d}] iter {step:4d}/{len(self.dl1)} "
-                          f"loss {running/self.log_step:.4f}  {elapsed}")
-                    self.writer.add_scalar("train/loss_iter", running/self.log_step,
-                                           (ep-1)*len(self.dl1)+step)
-                    swanlab.log({"train/loss_iter": running/self.log_step})
-                    running = 0.0
+            # 等待所有CUDA操作完成
+            torch.cuda.synchronize()
 
             # ---------- 验证 ----------
             auc = self.evaluate()
@@ -285,10 +323,74 @@ class Solver:
         self.model.eval()
         ys, ps = [], []
         for x, y in self.val:
-            ps.append(self.model(x.to(self.device))[1].cpu())
+            # 确保输入是 (B, 1, 96, 1400) 形状
+            if x.dim() == 3:  # (B, 96, 1400)
+                x = x.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+            
+            # 检查通道数是否正确
+            if x.size(1) != 1:
+                print(f"警告: 验证数据通道数不正确: {x.size(1)}，调整为 1")
+                x = x[:, 0:1]  # 只保留第一个通道
+            
+            # 检查并处理无效值
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # 标准化输入
+            x = (x - x.mean()) / (x.std() + 1e-8)
+            
+            # 添加输入值范围限制
+            x = torch.clamp(x, -3.0, 3.0)
+            
+            # 将数据移到设备上
+            x = x.to(self.device)
+            
+            # 使用模型进行预测
+            att, clf = self.model(x)
+            ps.append(clf.cpu())
             ys.append(y)
         ys, ps = torch.cat(ys).numpy(), torch.cat(ps).numpy()
         try:
             return metrics.roc_auc_score(ys, ps, average="macro")
         except ValueError:
             return 0.0
+
+    @torch.no_grad()
+    def test(self):
+        self.model.eval()
+        outputs = []
+        
+        for batch in self.dl1:
+            try:
+                x = batch[0].to(self.device)
+                
+                # 检查输入形状并纠正
+                # 确保输入是 (B, 1, 96, 1400) 形状
+                if x.dim() == 3:  # (B, 96, 1400)
+                    x = x.unsqueeze(1)  # 添加通道维度 -> (B, 1, 96, 1400)
+                
+                # 检查通道数是否正确
+                if x.size(1) != 1:
+                    print(f"警告: 测试数据通道数不正确: {x.size(1)}，调整为 1")
+                    x = x[:, 0:1]  # 只保留第一个通道
+                
+                # 检查并处理无效值
+                x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+                
+                # 标准化输入
+                x = (x - x.mean()) / (x.std() + 1e-8)
+                
+                # 添加输入值范围限制
+                x = torch.clamp(x, -3.0, 3.0)
+                
+                with torch.amp.autocast('cuda'):
+                    att, clf = self.model(x)
+                    o = torch.sigmoid(0.5 * (att + clf))
+                    outputs.append(o.cpu().numpy())
+            except Exception as e:
+                print(f"测试时出错: {str(e)}")
+                # 清理GPU内存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+                
+        return np.vstack(outputs)

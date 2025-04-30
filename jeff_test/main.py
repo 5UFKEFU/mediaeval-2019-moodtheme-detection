@@ -14,12 +14,12 @@ PATH = '../data'
 DATA_PATH = f'{PATH}/mediaeval-2019-jamendo/'
 LABELS_TXT = f'{PATH}/moodtheme_split.txt'
 TRAIN_PATH = f'{PATH}/autotagging_moodtheme-train.tsv'
-VAL_PATH = f'{PATH}/autotagging_moodtheme-validation.tsv'
+VAL_PATH = f'{PATH}/autotagging_moodtheme-valid.tsv'
 TEST_PATH = f'{PATH}/autotagging_moodtheme-test.tsv'
 
 CONFIG = {
         'log_dir': './output',
-        'batch_size': 8
+        'batch_size': 16
     }
 
 def get_labels_to_idx(labels_txt):
@@ -65,3 +65,4 @@ if __name__ == '__main__':
 
     #Predict and create submissions
     predict()
+

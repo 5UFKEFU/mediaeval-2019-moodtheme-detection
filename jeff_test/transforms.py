@@ -176,8 +176,14 @@ class ImageToTensor:
         # 确保数据在 GPU 上并归一化
         if not isinstance(tensor, torch.Tensor):
             tensor = torch.from_numpy(tensor).float()
-        if len(tensor.shape) == 2:
-            tensor = tensor.unsqueeze(0)
+            
+        # 确保是3D的 (1, N_MELS, T)
+        if len(tensor.shape) == 2:  # (N_MELS, T)
+            tensor = tensor.unsqueeze(0)  # 添加通道维度 -> (1, N_MELS, T)
+        elif len(tensor.shape) == 3 and tensor.shape[0] != 1:
+            # 如果已经是3D但第一维不是1，则需要调整
+            tensor = tensor.unsqueeze(0) if tensor.shape[0] == 96 else tensor[0:1]
+            
         return tensor.to(DEVICE)
 
 

@@ -43,14 +43,22 @@ class AudioFolder(Dataset):
             reader = csv.reader(f, delimiter="\t")
             next(reader)                # 跳 header
             for row in reader:
-                self.paths.append(row[3])                    # PATH
-                tag_str = row[5].replace('---', ',')
-                y = np.zeros(num_cls, np.float32)
-                for t in tag_str.split(','):
-                    t = t.strip()
-                    if t and t in lab2idx:
-                        y[lab2idx[t]] = 1.
-                self.labels.append(y)
+                path = row[3]
+                # 检查文件是否在允许的目录中（00-16，不包含07）
+                dir_prefix = path.split('/')[0]
+                try:
+                    dir_num = int(dir_prefix)
+                    if 0 <= dir_num <= 16 and dir_num != 7:
+                        self.paths.append(path)
+                        tag_str = row[5].replace('---', ',')
+                        y = np.zeros(num_cls, np.float32)
+                        for t in tag_str.split(','):
+                            t = t.strip()
+                            if t and t in lab2idx:
+                                y[lab2idx[t]] = 1.
+                        self.labels.append(y)
+                except ValueError:
+                    continue  # 跳过无效的目录名
         
         # 将标签转换为 CPU tensor
         self.labels = torch.from_numpy(np.array(self.labels))
@@ -71,44 +79,63 @@ class AudioFolder(Dataset):
     def __len__(self): return len(self.paths)
 
     def __getitem__(self, idx):
-        fp = os.path.join(self.root, self.paths[idx])
-        wav, sr = torchaudio.load(fp)               # 解码 (CPU)
+        max_retries = 5
+        current_idx = idx
+        
+        for _ in range(max_retries):
+            try:
+                fp = os.path.join(self.root, self.paths[current_idx])
+                if not os.path.exists(fp):
+                    print(f"File does not exist: {fp}")
+                    # Try the next file
+                    current_idx = (current_idx + 1) % len(self)
+                    continue
+                wav, sr = torchaudio.load(fp)               # 解码 (CPU)
 
-        if sr != 22050:
-            wav = T.Resample(sr, 22050)(wav)
-        wav = wav.mean(0, keepdim=True)
+                if sr != 22050:
+                    wav = T.Resample(sr, 22050)(wav)
+                wav = wav.mean(0, keepdim=True)
 
-        # 将数据移到与MEL相同的设备上
-        wav = wav.to(MEL_DEVICE)
+                # 将数据移到与MEL相同的设备上
+                wav = wav.to(MEL_DEVICE)
+                
+                # 生成 mel spectrogram
+                mel = MEL(wav).log()
+                mel = mel.squeeze(0)
+                
+                # 在 GPU 上进行 padding
+                if mel.shape[1] >= TARGET_LEN:
+                    mel = mel[:, :TARGET_LEN]
+                else:
+                    rep = TARGET_LEN // mel.shape[1] + 1
+                    mel = torch.tile(mel, (1, rep))[:, :TARGET_LEN]
+                
+                # 应用数据增强
+                mel = self.transform(mel)
+                
+                # 确保输出大小一致
+                if mel.shape[0] != N_MELS:
+                    mel = mel.unsqueeze(0)
+                    mel = F.interpolate(
+                        mel,
+                        size=(N_MELS, TARGET_LEN),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+                
+                # 将数据移回 CPU
+                mel = mel.cpu()
+                
+                return mel, self.labels[current_idx]
+                
+            except Exception as e:
+                print(f"Error loading file {fp}: {str(e)}")
+                # 尝试下一个文件
+                current_idx = (current_idx + 1) % len(self)
         
-        # 生成 mel spectrogram
-        mel = MEL(wav).log()
-        mel = mel.squeeze(0)
-        
-        # 在 GPU 上进行 padding
-        if mel.shape[1] >= TARGET_LEN:
-            mel = mel[:, :TARGET_LEN]
-        else:
-            rep = TARGET_LEN // mel.shape[1] + 1
-            mel = torch.tile(mel, (1, rep))[:, :TARGET_LEN]
-        
-        # 应用数据增强
-        mel = self.transform(mel)
-        
-        # 确保输出大小一致
-        if mel.shape[0] != N_MELS:
-            mel = mel.unsqueeze(0)
-            mel = F.interpolate(
-                mel,
-                size=(N_MELS, TARGET_LEN),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-        
-        # 将数据移回 CPU
-        mel = mel.cpu()
-        
-        return mel, self.labels[idx]
+        # 如果所有重试都失败，返回一个空的 mel spectrogram
+        print(f"Warning: Failed to load audio after {max_retries} attempts, returning zero tensor")
+        return torch.zeros((N_MELS, TARGET_LEN)), self.labels[current_idx]
 
 def get_audio_loader(root, tsv, lab2idx,
                      batch_size=16, num_workers=1,  # 减少到1个worker

@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
 from model import MusicSelfAttModel
+import swanlab
 
 class Solver():
     def __init__(self, data_loader1, data_loader2, valid_loader, tag_list, config):
@@ -129,18 +130,40 @@ class Solver():
                             (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             epoch+1, self.n_epochs, ctr, len(self.data_loader1), (step_loss/self.log_step),
                             datetime.timedelta(seconds=time.time()-start_t)))
+                    # 记录训练损失到SwanLab
+                    swanlab.log({
+                        "train/loss": step_loss/self.log_step,
+                        "train/epoch": epoch+1,
+                        "train/iteration": ctr
+                    })
                     step_loss = 0
 
-            self.writer.add_scalar('Loss/train', epoch_loss/len(self.data_loader1), epoch)
+            # 记录epoch损失到SwanLab
+            swanlab.log({
+                "train/epoch_loss": epoch_loss/len(self.data_loader1),
+                "train/epoch": epoch+1
+            })
 
             # validation
-            roc_auc, _ = self._validation(start_t, epoch)
+            roc_auc, pr_auc = self._validation(start_t, epoch)
+
+            # 记录验证指标到SwanLab
+            swanlab.log({
+                "val/roc_auc": roc_auc,
+                "val/pr_auc": pr_auc,
+                "val/epoch": epoch+1
+            })
 
             # save model
             if roc_auc > best_roc_auc:
                 print('best model: %4f' % roc_auc)
                 best_roc_auc = roc_auc
                 torch.save(self.model.state_dict(), os.path.join(self.model_save_path, 'best_model.pth'))
+                # 记录最佳模型指标
+                swanlab.log({
+                    "best/roc_auc": best_roc_auc,
+                    "best/epoch": epoch+1
+                })
 
             if epoch%10 ==0:
                 print(f'Saving model at epoch {epoch}')
@@ -152,6 +175,8 @@ class Solver():
         print("[%s] Train finished. Elapsed: %s"
                 % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     datetime.timedelta(seconds=time.time() - start_t)))
+        
+        return best_roc_auc, pr_auc
 
     def _validation(self, start_t, epoch):
         prd1_array = []  # prediction
