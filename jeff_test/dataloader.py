@@ -5,6 +5,7 @@ import torch
 from torch.utils import data
 import librosa
 from transforms import get_transforms
+import json
 
 def get_spectrogram(full_spect, size=1400):
     full_len = full_spect.shape[1]
@@ -22,14 +23,28 @@ def get_spectrogram(full_spect, size=1400):
                 diff = 0
     return audio
 
+def normalize_tag(tag, tag_map):
+    """使用tag_map.json规范化标签"""
+    # 移除前缀
+    if '---' in tag:
+        tag_type, tag_value = tag.split('---', 1)
+    else:
+        return tag  # 如果不是标准格式，直接返回
+        
+    # 在对应的映射中查找
+    if tag_type in tag_map and tag_value in tag_map[tag_type]:
+        return f"{tag_type}---{tag_map[tag_type][tag_value]}"
+    return tag
+
 class AudioFolder(data.Dataset):
-    def __init__(self, root, tsv_path, labels_to_idx, num_classes=56, spect_len=4096, train=True):
+    def __init__(self, root, tsv_paths, labels_to_idx, num_classes=104, spect_len=4096, train=True):
         self.train = train
         self.root = root
         self.num_classes = num_classes
         self.spect_len = spect_len
         self.labels_to_idx = labels_to_idx
-        self.prepare_data(tsv_path)
+        
+        self.prepare_data(tsv_paths)
 
         self.transform = get_transforms(
             train=train,
@@ -82,23 +97,37 @@ class AudioFolder(data.Dataset):
         target = torch.zeros(self.num_classes).scatter_(0, labels, 1)
         return target
 
-    def prepare_data(self, path_to_tsv):
+    def prepare_data(self, tsv_paths):
         all_dict = {
             'PATH': [],
             'TAGS': []
         }
-        with open(path_to_tsv) as tsvfile:
-            tsvreader = csv.reader(tsvfile, delimiter="\t")
-            next(tsvreader)  # 跳过表头
-            for line in tsvreader:
-                all_dict['PATH'].append(line[3])  # mp3路径列
-                all_dict['TAGS'].append(line[5:]) # 标签列
+        
+        # 处理多个标签文件
+        for tsv_path in tsv_paths:
+            with open(tsv_path) as tsvfile:
+                tsvreader = csv.reader(tsvfile, delimiter="\t")
+                next(tsvreader)  # 跳过表头
+                for line in tsvreader:
+                    if len(line) < 6:  # 确保行有足够的列
+                        continue
+                        
+                    if line[3] not in all_dict['PATH']:  # 如果路径不存在，添加新记录
+                        all_dict['PATH'].append(line[3])
+                        all_dict['TAGS'].append([])
+                    
+                    # 找到对应的路径索引
+                    idx = all_dict['PATH'].index(line[3])
+                    # 处理标签，从第6列开始
+                    tag = line[5].strip()  # 获取标签并去除空白字符
+                    if tag in self.labels_to_idx:
+                        all_dict['TAGS'][idx].append(self.labels_to_idx[tag])
 
         self.paths = all_dict['PATH']
-        self.tags = [[self.labels_to_idx[j] for j in i] for i in all_dict['TAGS']]
+        self.tags = all_dict['TAGS']
 
-def get_audio_loader(root, tsv_path, labels_to_idx, batch_size=32, num_workers=8, shuffle=True, drop_last=True, train=True):
-    dataset = AudioFolder(root, tsv_path, labels_to_idx, num_classes=56, train=train)
+def get_audio_loader(root, tsv_paths, labels_to_idx, batch_size=32, num_workers=8, shuffle=True, drop_last=True, train=True):
+    dataset = AudioFolder(root, tsv_paths, labels_to_idx, num_classes=104, train=train)
     loader = data.DataLoader(
         dataset=dataset,
         batch_size=batch_size,

@@ -39,7 +39,7 @@ class Solver():
         self.model_save_path = config['log_dir']
         self.batch_size = config['batch_size']
         self.tag_list = tag_list
-        self.num_class = 56
+        self.num_class = 72
         self.writer = SummaryWriter(config['log_dir'])
         self.model_fn = os.path.join(self.model_save_path, 'best_model.pth')
 

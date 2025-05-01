@@ -3,13 +3,17 @@ import torch.nn as nn
 import torchvision
 from self_attention import AttentionModule
 
-NUM_CLASSES=56
+# 标签数量统计：
+# genre: 31个
+# instrument: 14个
+# theme: 59个
+NUM_CLASSES = 104  # 31 + 14 + 59
 HIDDEN_SIZE = 256
 
 class MusicSelfAttModel(nn.Module):
     def __init__(self):
         super(MusicSelfAttModel, self).__init__()
-        self.mirex = MobileNetV2(56).cuda()
+        self.mirex = MobileNetV2(104).cuda()
         self.att_model = nn.Sequential(
             AttentionModule(),
             nn.Dropout(0.2),
@@ -48,7 +52,7 @@ class MusicSelfAttModel(nn.Module):
         att = self.att_model(att)
         clf = x.view(-1, 256)
         clf = self.classifier(clf)
-        clf = clf.view(-1, 16, 56)
+        clf = clf.view(-1, 16, 104)
         clf = clf.mean(dim=1)
     
         return att, clf

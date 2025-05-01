@@ -23,82 +23,28 @@ from collections import defaultdict
 # 设置 OpenAI API 密钥
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
+# 加载标签映射
+with open('../data/data/tag_map.json', 'r', encoding='utf-8') as f:
+    TAG_MAP = json.load(f)
 
-# 官方标准56个标签及其中文解释
-OFFICIAL_LABELS = {
-    "mood/theme---action": "动作",
-    "mood/theme---adventure": "冒险",
-    "mood/theme---advertising": "广告",
-    "mood/theme---background": "背景音乐",
-    "mood/theme---calm": "平静",
-    "mood/theme---children": "儿童",
-    "mood/theme---christmas": "圣诞",
-    "mood/theme---commercial": "商业",
-    "mood/theme---cool": "酷",
-    "mood/theme---corporate": "企业",
-    "mood/theme---dark": "黑暗",
-    "mood/theme---deep": "深沉",
-    "mood/theme---documentary": "纪录片",
-    "mood/theme---dreamy": "梦幻",
-    "mood/theme---driving": "驾驶",
-    "mood/theme---emotional": "情感",
-    "mood/theme---energetic": "活力",
-    "mood/theme---epic": "史诗",
-    "mood/theme---fast": "快速",
-    "mood/theme---film": "电影",
-    "mood/theme---fun": "有趣",
-    "mood/theme---fusion": "融合",
-    "mood/theme---game": "游戏",
-    "mood/theme---groovy": "律动",
-    "mood/theme---happy": "快乐",
-    "mood/theme---heavy": "沉重",
-    "mood/theme---holiday": "假日",
-    "mood/theme---hopeful": "希望",
-    "mood/theme---house": "浩室",
-    "mood/theme---inspiring": "鼓舞人心",
-    "mood/theme---light": "轻快",
-    "mood/theme---love": "爱情",
-    "mood/theme---meditative": "冥想",
-    "mood/theme---melancholic": "忧郁",
-    "mood/theme---motivational": "励志",
-    "mood/theme---nature": "自然",
-    "mood/theme---party": "派对",
-    "mood/theme---positive": "积极",
-    "mood/theme---powerful": "强大",
-    "mood/theme---relaxing": "放松",
-    "mood/theme---retro": "复古",
-    "mood/theme---road-trip": "公路旅行",
-    "mood/theme---romantic": "浪漫",
-    "mood/theme---sad": "悲伤",
-    "mood/theme---sexy": "性感",
-    "mood/theme---slow": "缓慢",
-    "mood/theme---smooth": "流畅",
-    "mood/theme---soft": "柔和",
-    "mood/theme---space": "太空",
-    "mood/theme---sport": "运动",
-    "mood/theme---summer": "夏天",
-    "mood/theme---travel": "旅行",
-    "mood/theme---upbeat": "欢快",
-    "mood/theme---warm": "温暖"
-}
+# 创建官方标签列表
+OFFICIAL_LABELS = {}
+OFFICIAL_LABEL_LIST = []
 
-OFFICIAL_LABEL_LIST = [
-    "mood/theme---action", "mood/theme---adventure", "mood/theme---advertising",
-    "mood/theme---background", "mood/theme---calm", "mood/theme---children",
-    "mood/theme---christmas", "mood/theme---commercial", "mood/theme---cool",
-    "mood/theme---corporate", "mood/theme---dark", "mood/theme---deep",
-    "mood/theme---documentary", "mood/theme---dreamy", "mood/theme---driving",
-    "mood/theme---emotional", "mood/theme---energetic", "mood/theme---epic",
-    "mood/theme---fast", "mood/theme---film", "mood/theme---fun", "mood/theme---fusion",
-    "mood/theme---game", "mood/theme---groovy", "mood/theme---happy", "mood/theme---heavy",
-    "mood/theme---holiday", "mood/theme---hopeful", "mood/theme---house", "mood/theme---inspiring",
-    "mood/theme---light", "mood/theme---love", "mood/theme---meditative", "mood/theme---melancholic",
-    "mood/theme---motivational", "mood/theme---nature", "mood/theme---party", "mood/theme---positive",
-    "mood/theme---powerful", "mood/theme---relaxing", "mood/theme---retro", "mood/theme---road-trip",
-    "mood/theme---romantic", "mood/theme---sad", "mood/theme---sexy", "mood/theme---slow",
-    "mood/theme---smooth", "mood/theme---soft", "mood/theme---space", "mood/theme---sport",
-    "mood/theme---summer", "mood/theme---travel", "mood/theme---upbeat", "mood/theme---warm"
-]
+# 添加mood/theme标签
+for tag in sorted(set(TAG_MAP['mood/theme'].values())):
+    OFFICIAL_LABELS[f"mood/theme---{tag}"] = tag
+    OFFICIAL_LABEL_LIST.append(f"mood/theme---{tag}")
+
+# 添加genre标签
+for tag in sorted(set(TAG_MAP['genre'].values())):
+    OFFICIAL_LABELS[f"genre---{tag}"] = tag
+    OFFICIAL_LABEL_LIST.append(f"genre---{tag}")
+
+# 添加instrument标签
+for tag in sorted(set(TAG_MAP['instrument'].values())):
+    OFFICIAL_LABELS[f"instrument---{tag}"] = tag
+    OFFICIAL_LABEL_LIST.append(f"instrument---{tag}")
 
 # 用于记录非官方标签的字典
 non_official_tags = defaultdict(int)
@@ -119,8 +65,12 @@ def get_llm_tags(song_name, artist):
     try:
         print(f"\n使用 LLM 分析歌曲 {song_name} - {artist}...")
         # 构建查询
-        query = f"""请分析歌曲 '{song_name}' 的演唱者 '{artist}' 的风格和情感特征。
-请提供5个最合适的标签（用逗号分隔）。
+        query = f"""请分析歌曲 '{song_name}' 的演唱者 '{artist}' 的风格、情感特征和使用的乐器。
+请提供以下类型的标签（用逗号分隔）：
+1. 情感/主题标签（最多3个）
+2. 乐器标签（最多3个）
+3. 风格标签（最多2个）
+
 如果标签不在以下列表中，也请提供，但请标注为"非官方标签"：
 {', '.join(OFFICIAL_LABEL_LIST)}"""
         
@@ -128,14 +78,14 @@ def get_llm_tags(song_name, artist):
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "你是一个音乐分析专家，擅长分析歌曲的风格和情感特征。"},
+                {"role": "system", "content": "你是一个音乐分析专家，擅长分析歌曲的风格、情感特征和使用的乐器。"},
                 {"role": "user", "content": query}
             ],
-            max_tokens=150
+            max_tokens=200
         )
         
         # 提取标签
-        response_text = response.choices[0].message.content.strip()
+        response_text = response.choices[0].message.content
         tags = [tag.strip() for tag in response_text.split(',')]
         
         # 分离官方标签和非官方标签

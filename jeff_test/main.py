@@ -8,17 +8,30 @@ import numpy as np
 import argparse
 from sklearn.model_selection import KFold
 import pandas as pd
+import json
 
 from dataloader import get_audio_loader
 from solver import Solver
 
 # Set paths
-PATH = '../data'
-DATA_PATH = f'{PATH}/mediaeval-2019-jamendo/'
-LABELS_TXT = f'{PATH}/moodtheme_split.txt'
-TRAIN_PATH = f'{PATH}/autotagging_moodtheme-train.tsv'
-VAL_PATH = f'{PATH}/autotagging_moodtheme-valid.tsv'
-TEST_PATH = f'{PATH}/autotagging_moodtheme-test.tsv'
+PATH = 'data'
+DATA_PATH = f'{PATH}/audio/'
+TAG_MAP_PATH = f'{PATH}/tag_map.json'
+TRAIN_PATHS = [
+    f'{PATH}/moodtheme-train.tsv',
+    f'{PATH}/genre-train.tsv',
+    f'{PATH}/instrument-train.tsv'
+]
+VAL_PATHS = [
+    f'{PATH}/moodtheme-valid.tsv',
+    f'{PATH}/genre-valid.tsv',
+    f'{PATH}/instrument-valid.tsv'
+]
+TEST_PATHS = [
+    f'{PATH}/moodtheme-test.tsv',
+    f'{PATH}/genre-test.tsv',
+    f'{PATH}/instrument-test.tsv'
+]
 
 CONFIG = {
         'log_dir': './output',
@@ -30,50 +43,56 @@ CONFIG = {
         'n_splits': 5  # 交叉验证折数
     }
 
-def get_labels_to_idx(labels_txt):
-    labels_to_idx = {}
-    tag_list = []
-    with open(labels_txt) as f:
-        lines = f.readlines()
-
-    for i,l in enumerate(lines):
-        tag_list.append(l.strip())
-        labels_to_idx[l.strip()] = i
-
+def get_labels_to_idx(tag_map_path):
+    """从all_tags.txt加载标签映射"""
+    with open('data/tags/all_tags.txt', 'r', encoding='utf-8') as f:
+        tag_list = [line.strip() for line in f.readlines()]
+    
+    # 创建标签到索引的映射
+    labels_to_idx = {tag: idx for idx, tag in enumerate(tag_list)}
+    
     return labels_to_idx, tag_list
 
 def cross_validate():
     """执行交叉验证"""
-    # 读取训练数据
-    train_data = pd.read_csv(TRAIN_PATH, sep='\t')
+    # 读取所有训练数据
+    train_dfs = [pd.read_csv(path, sep='\t') for path in TRAIN_PATHS]
     kf = KFold(n_splits=CONFIG['n_splits'], shuffle=True, random_state=42)
     
     fold_results = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(train_data)):
+    for fold, (train_idx, val_idx) in enumerate(kf.split(train_dfs[0])):  # 使用第一个数据集的索引
         print(f"\nStarting fold {fold + 1}/{CONFIG['n_splits']}")
         
         # 创建当前fold的训练和验证数据
-        fold_train = train_data.iloc[train_idx]
-        fold_val = train_data.iloc[val_idx]
-        
-        # 保存临时数据文件
-        fold_train.to_csv(f"{CONFIG['log_dir']}/fold_{fold}_train.tsv", sep='\t', index=False)
-        fold_val.to_csv(f"{CONFIG['log_dir']}/fold_{fold}_val.tsv", sep='\t', index=False)
+        fold_train_paths = []
+        fold_val_paths = []
+        for df in train_dfs:
+            fold_train = df.iloc[train_idx]
+            fold_val = df.iloc[val_idx]
+            
+            # 保存临时数据文件
+            train_path = f"{CONFIG['log_dir']}/fold_{fold}_train_{os.path.basename(df.columns[0])}.tsv"
+            val_path = f"{CONFIG['log_dir']}/fold_{fold}_val_{os.path.basename(df.columns[0])}.tsv"
+            fold_train.to_csv(train_path, sep='\t', index=False)
+            fold_val.to_csv(val_path, sep='\t', index=False)
+            
+            fold_train_paths.append(train_path)
+            fold_val_paths.append(val_path)
         
         # 初始化SwanLab实验
         swanlab.init(
-            experiment_name=f"moodtheme-detection-fold-{fold}",
+            experiment_name=f"multi-tag-detection-fold-{fold}",
             description=f"Cross-validation fold {fold + 1}",
             config=CONFIG
         )
         
         # 训练和验证
-        labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)
-        train_loader1 = get_audio_loader(DATA_PATH, f"{CONFIG['log_dir']}/fold_{fold}_train.tsv", 
+        labels_to_idx, tag_list = get_labels_to_idx(TAG_MAP_PATH)
+        train_loader1 = get_audio_loader(DATA_PATH, fold_train_paths, 
                                        labels_to_idx, batch_size=CONFIG['batch_size'])
-        train_loader2 = get_audio_loader(DATA_PATH, f"{CONFIG['log_dir']}/fold_{fold}_train.tsv", 
+        train_loader2 = get_audio_loader(DATA_PATH, fold_train_paths, 
                                        labels_to_idx, batch_size=CONFIG['batch_size'])
-        val_loader = get_audio_loader(DATA_PATH, f"{CONFIG['log_dir']}/fold_{fold}_val.tsv", 
+        val_loader = get_audio_loader(DATA_PATH, fold_val_paths, 
                                     labels_to_idx, batch_size=CONFIG['batch_size'], shuffle=False, drop_last=False)
         
         solver = Solver(train_loader1, train_loader2, val_loader, tag_list, CONFIG)
@@ -86,8 +105,10 @@ def cross_validate():
         })
         
         # 清理临时文件
-        os.remove(f"{CONFIG['log_dir']}/fold_{fold}_train.tsv")
-        os.remove(f"{CONFIG['log_dir']}/fold_{fold}_val.tsv")
+        for train_path in fold_train_paths:
+            os.remove(train_path)
+        for val_path in fold_val_paths:
+            os.remove(val_path)
     
     # 计算平均结果
     avg_roc_auc = np.mean([r['roc_auc'] for r in fold_results])
@@ -108,25 +129,25 @@ def cross_validate():
 def train():
     # 初始化SwanLab实验
     swanlab.init(
-        experiment_name="moodtheme-detection",
-        description="Training mood and theme detection model",
+        experiment_name="multi-tag-detection",
+        description="Training multi-tag detection model (mood, genre, instrument)",
         config=CONFIG
     )
     
     config = CONFIG
-    labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)    
+    labels_to_idx, tag_list = get_labels_to_idx(TAG_MAP_PATH)    
 
-    train_loader1 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx, batch_size=config['batch_size'])
-    train_loader2 = get_audio_loader(DATA_PATH, TRAIN_PATH, labels_to_idx, batch_size=config['batch_size'])
-    val_loader = get_audio_loader(DATA_PATH, VAL_PATH, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
-    solver = Solver(train_loader1,train_loader2, val_loader, tag_list, config)
+    train_loader1 = get_audio_loader(DATA_PATH, TRAIN_PATHS, labels_to_idx, batch_size=config['batch_size'])
+    train_loader2 = get_audio_loader(DATA_PATH, TRAIN_PATHS, labels_to_idx, batch_size=config['batch_size'])
+    val_loader = get_audio_loader(DATA_PATH, VAL_PATHS, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    solver = Solver(train_loader1, train_loader2, val_loader, tag_list, config)
     solver.train()
 
 def predict():
     config = CONFIG
-    labels_to_idx, tag_list = get_labels_to_idx(LABELS_TXT)
+    labels_to_idx, tag_list = get_labels_to_idx(TAG_MAP_PATH)
 
-    test_loader = get_audio_loader(DATA_PATH, TEST_PATH, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    test_loader = get_audio_loader(DATA_PATH, TEST_PATHS, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
 
     solver = Solver(test_loader,None, None, tag_list, config)
     predictions = solver.test()
