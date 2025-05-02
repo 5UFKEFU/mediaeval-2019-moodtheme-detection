@@ -1,6 +1,6 @@
 import os
 # 设置PyTorch内存分配器配置
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
 
 import swanlab
 from sklearn.metrics import precision_recall_curve
@@ -35,12 +35,14 @@ TEST_PATHS = [
 
 CONFIG = {
         'log_dir': './output',
-        'batch_size': 16,
-        'num_workers': 4,
-        'pin_memory': True,
-        'prefetch_factor': 2,
-        'persistent_workers': True,
-        'n_splits': 5  # 交叉验证折数
+        'batch_size': 8,
+        'num_workers': 2,
+        'pin_memory': False,
+        'prefetch_factor': 1,
+        'persistent_workers': False,
+        'n_splits': 5,  # 交叉验证折数
+        'test_mode': False,  # 测试模式标志
+        'resume_path': None  # 新增检查点路径
     }
 
 def get_labels_to_idx(tag_map_path):
@@ -57,6 +59,11 @@ def cross_validate():
     """执行交叉验证"""
     # 读取所有训练数据
     train_dfs = [pd.read_csv(path, sep='\t') for path in TRAIN_PATHS]
+    
+    # 如果是测试模式，只取前100条数据
+    if CONFIG['test_mode']:
+        train_dfs = [df.head(100) for df in train_dfs]
+    
     kf = KFold(n_splits=CONFIG['n_splits'], shuffle=True, random_state=42)
     
     fold_results = []
@@ -137,19 +144,67 @@ def train():
     config = CONFIG
     labels_to_idx, tag_list = get_labels_to_idx(TAG_MAP_PATH)    
 
-    train_loader1 = get_audio_loader(DATA_PATH, TRAIN_PATHS, labels_to_idx, batch_size=config['batch_size'])
-    train_loader2 = get_audio_loader(DATA_PATH, TRAIN_PATHS, labels_to_idx, batch_size=config['batch_size'])
-    val_loader = get_audio_loader(DATA_PATH, VAL_PATHS, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    # 如果是测试模式，只取前100条数据
+    if config['test_mode']:
+        train_paths = [f"{CONFIG['log_dir']}/test_train_{os.path.basename(path)}" for path in TRAIN_PATHS]
+        val_paths = [f"{CONFIG['log_dir']}/test_val_{os.path.basename(path)}" for path in VAL_PATHS]
+        
+        # 创建测试用的临时文件
+        for i, path in enumerate(TRAIN_PATHS):
+            df = pd.read_csv(path, sep='\t')
+            df.head(100).to_csv(train_paths[i], sep='\t', index=False)
+        
+        for i, path in enumerate(VAL_PATHS):
+            df = pd.read_csv(path, sep='\t')
+            df.head(20).to_csv(val_paths[i], sep='\t', index=False)
+    else:
+        train_paths = TRAIN_PATHS
+        val_paths = VAL_PATHS
+
+    train_loader1 = get_audio_loader(DATA_PATH, train_paths, labels_to_idx, batch_size=config['batch_size'])
+    train_loader2 = get_audio_loader(DATA_PATH, train_paths, labels_to_idx, batch_size=config['batch_size'])
+    val_loader = get_audio_loader(DATA_PATH, val_paths, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
     solver = Solver(train_loader1, train_loader2, val_loader, tag_list, config)
-    solver.train()
+    
+    # 如果指定了检查点，加载模型
+    if config['resume_path'] and os.path.exists(config['resume_path']):
+        print(f"Resuming training from checkpoint: {config['resume_path']}")
+        solver.load(config['resume_path'])
+    
+    for epoch in range(10):  # Assuming a default range for epochs
+        solver.train()
+        # 每个epoch都保存检查点
+        checkpoint_path = os.path.join(config['log_dir'], f'model_epoch_{epoch}.pth')
+        solver.save(checkpoint_path)
+        print(f'Saved checkpoint at epoch {epoch} to {checkpoint_path}')
+        
+        # 记录检查点信息到SwanLab，只记录epoch数
+        swanlab.log({
+            "checkpoint/epoch": epoch+1
+        })
+
+    # 如果是测试模式，清理临时文件
+    if config['test_mode']:
+        for path in train_paths + val_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
 def predict():
     config = CONFIG
     labels_to_idx, tag_list = get_labels_to_idx(TAG_MAP_PATH)
 
-    test_loader = get_audio_loader(DATA_PATH, TEST_PATHS, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+    # 如果是测试模式，只取前20条数据
+    if config['test_mode']:
+        test_paths = [f"{CONFIG['log_dir']}/test_test_{os.path.basename(path)}" for path in TEST_PATHS]
+        for i, path in enumerate(TEST_PATHS):
+            df = pd.read_csv(path, sep='\t')
+            df.head(20).to_csv(test_paths[i], sep='\t', index=False)
+    else:
+        test_paths = TEST_PATHS
 
-    solver = Solver(test_loader,None, None, tag_list, config)
+    test_loader = get_audio_loader(DATA_PATH, test_paths, labels_to_idx, batch_size=config['batch_size'], shuffle=False, drop_last=False)
+
+    solver = Solver(test_loader, None, None, tag_list, config)
     predictions = solver.test()
 
     # 分别保存预测结果的不同部分
@@ -160,12 +215,26 @@ def predict():
     
     print(f"Predictions saved successfully in {CONFIG['log_dir']}")
 
+    # 如果是测试模式，清理临时文件
+    if config['test_mode']:
+        for path in test_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', 
                        choices=['train', 'predict', 'cross_validate'], 
                        help='Mode to run: train, predict, or cross_validate')
+    parser.add_argument('--test', action='store_true',
+                       help='Run in test mode with small dataset')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint to resume training from')
     args = parser.parse_args()
+    
+    # 设置测试模式
+    CONFIG['test_mode'] = args.test
+    CONFIG['resume_path'] = args.resume
     
     if args.mode == 'train':
         #Train the data

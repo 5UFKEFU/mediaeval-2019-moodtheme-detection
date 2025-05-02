@@ -67,7 +67,7 @@ class MobileNetV2(nn.Module):
             nn.Conv2d(1, 10, 1, padding=0), nn.ReLU(),
             nn.Conv2d(10, 3, 1, padding=0), nn.ReLU())
 
-        self.mv2 = torchvision.models.mobilenet_v2(pretrained=True)
+        self.mv2 = torchvision.models.mobilenet_v2(weights=torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V1)
         self.out_conv = nn.Sequential(
             nn.Conv2d(1280, 512, 3), nn.ReLU(),
             nn.Conv2d(512, 256, 1), nn.ReLU())

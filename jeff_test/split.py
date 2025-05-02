@@ -14,8 +14,8 @@ with open("data/tag_map.json", 'r', encoding='utf-8') as f:
 official_labels = []
 
 # 添加mood/theme标签
-for tag in sorted(set(TAG_MAP['theme'].values())):
-    official_labels.append(f"theme---{tag}")
+for tag in sorted(set(TAG_MAP['mood/theme'].values())):
+    official_labels.append(f"mood/theme---{tag}")
 
 # 添加genre标签
 for tag in sorted(set(TAG_MAP['genre'].values())):
@@ -117,7 +117,7 @@ def main():
     print("\n✅ 所有文件切分并清洗完成！")
     print(f"总训练集大小: {total_train}")
     print(f"总验证集大小: {total_valid}")
-    print(f"总测试集大小: {total_test}")
+    print(f"总测试集大小: {test_size}")
 
 if __name__ == "__main__":
     main()

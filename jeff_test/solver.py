@@ -21,6 +21,7 @@ class Solver():
         self.data_loader1 = data_loader1
         self.data_loader2 = data_loader2
         self.valid_loader = valid_loader
+        self.config = config  # 保存config
 
         # Training settings
         self.n_epochs = 120
@@ -36,10 +37,19 @@ class Solver():
             # 清理GPU缓存
             torch.cuda.empty_cache()
             
+            # 设置GPU温度限制
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                pynvml.nvmlDeviceSetTemperatureThreshold(handle, pynvml.NVML_TEMPERATURE_THRESHOLD_GPU_MAX, 85)  # 设置最高温度85度
+            except Exception as e:
+                print(f"Warning: Could not set GPU temperature threshold: {e}")
+            
         self.model_save_path = config['log_dir']
         self.batch_size = config['batch_size']
         self.tag_list = tag_list
-        self.num_class = 72
+        self.num_class = 104
         self.writer = SummaryWriter(config['log_dir'])
         self.model_fn = os.path.join(self.model_save_path, 'best_model.pth')
 
@@ -56,17 +66,127 @@ class Solver():
         self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
 
     def load(self, filename):
-        S = torch.load(filename)
-        self.model.load_state_dict(S)
+        try:
+            checkpoint = torch.load(filename)
+            if isinstance(checkpoint, dict):
+                if 'model' in checkpoint:
+                    self.model.load_state_dict(checkpoint['model'])
+                if 'optimizer' in checkpoint:
+                    try:
+                        # 确保优化器状态包含所有必要的键
+                        optimizer_state = checkpoint['optimizer']
+                        for param_group in optimizer_state['param_groups']:
+                            for p in param_group['params']:
+                                if p in optimizer_state['state']:
+                                    state = optimizer_state['state'][p]
+                                    if 'step' not in state:
+                                        state['step'] = torch.tensor(0)
+                        self.optimizer.load_state_dict(optimizer_state)
+                    except (KeyError, RuntimeError) as e:
+                        print(f"Warning: Could not load optimizer state: {e}")
+                        print("Continuing with default optimizer state")
+                        # 重新初始化优化器
+                        self.optimizer = torch.optim.Adam(self.model.parameters(), self.lr)
+            else:
+                self.model.load_state_dict(checkpoint)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            raise
 
     def save(self, filename):
-        model = self.model.state_dict()
-        torch.save({'model': model}, filename)
+        try:
+            # 确保优化器状态包含所有必要的键
+            optimizer_state = self.optimizer.state_dict()
+            for param_group in optimizer_state['param_groups']:
+                for p in param_group['params']:
+                    if p in self.optimizer.state:
+                        state = self.optimizer.state[p]
+                        if 'step' not in state:
+                            state['step'] = torch.tensor(0)
+            
+            checkpoint = {
+                'model': self.model.state_dict(),
+                'optimizer': optimizer_state,
+                'epoch': self.current_epoch if hasattr(self, 'current_epoch') else 0,
+                'best_roc_auc': self.best_roc_auc if hasattr(self, 'best_roc_auc') else 0
+            }
+            torch.save(checkpoint, filename)
+            print(f"Successfully saved checkpoint to {filename}")
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+            raise
 
     def to_var(self, x):
         if self.is_cuda:
             x = x.cuda()
         return x
+
+    def check_temperatures(self):
+        """检查GPU和CPU温度"""
+        temp_warning = False
+        message = []
+        
+        # 检查GPU温度
+        if self.is_cuda:
+            try:
+                # 首先尝试使用WMI获取GPU温度
+                import wmi
+                w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+                temperature_infos = w.Sensor()
+                gpu_temp = None
+                for sensor in temperature_infos:
+                    if sensor.SensorType == 'Temperature' and 'GPU Core' in sensor.Name:
+                        gpu_temp = float(sensor.Value)
+                        break
+                
+                # 如果WMI方法失败，尝试使用nvidia-smi
+                if gpu_temp is None:
+                    import subprocess
+                    output = subprocess.check_output(['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader'])
+                    gpu_temp = float(output.decode().strip())
+                
+                message.append(f"GPU Temperature: {gpu_temp}°C")
+                if gpu_temp > 80:
+                    temp_warning = True
+            except Exception as e:
+                print(f"Error getting GPU temperature: {e}")
+                message.append("Could not read GPU temperature")
+        
+        # 检查CPU温度
+        try:
+            import wmi
+            w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+            temperature_infos = w.Sensor()
+            cpu_temp = None
+            for sensor in temperature_infos:
+                if sensor.SensorType == 'Temperature' and 'Temperature #1' in sensor.Name:
+                    cpu_temp = float(sensor.Value)
+                    break
+            
+            if cpu_temp is not None:
+                message.append(f"CPU Temperature: {cpu_temp}°C")
+                if cpu_temp > 80:
+                    temp_warning = True
+            else:
+                # 如果无法获取温度，使用CPU使用率作为参考
+                import psutil
+                cpu_usage = psutil.cpu_percent(interval=1)
+                message.append(f"CPU Usage: {cpu_usage}%")
+                if cpu_usage > 90:  # 如果CPU使用率超过90%，也发出警告
+                    temp_warning = True
+        except Exception as e:
+            print(f"Error getting CPU temperature: {e}")
+            message.append("Could not read CPU temperature")
+        
+        # 打印温度信息
+        print(" | ".join(message))
+        
+        # 如果温度过高，暂停训练
+        if temp_warning:
+            print("Temperature too high, pausing for 30 seconds...")
+            time.sleep(30)
+            return True
+        return False
 
     def train(self):
         start_t = time.time()
@@ -75,7 +195,32 @@ class Solver():
         drop_counter = 0
         reconst_loss = nn.BCELoss()
 
-        for epoch in range(self.n_epochs):
+        # 获取起始epoch
+        start_epoch = 0
+        if hasattr(self, 'config') and 'resume_path' in self.config and self.config['resume_path']:
+            # 从文件名中提取epoch数
+            import re
+            match = re.search(r'model_epoch_(\d+)\.pth', self.config['resume_path'])
+            if match:
+                start_epoch = int(match.group(1))
+                print(f"Resuming from epoch {start_epoch}")
+                # 加载模型
+                self.load(self.config['resume_path'])
+                # 根据epoch调整优化器状态
+                if start_epoch >= 60:
+                    self.optimizer = torch.optim.SGD(self.model.parameters(), 0.001, momentum=0.9, weight_decay=0.0001, nesterov=True)
+                    current_optimizer = 'sgd_1'
+                    drop_counter = start_epoch - 60
+                elif start_epoch >= 80:
+                    self.optimizer = torch.optim.SGD(self.model.parameters(), 0.0001, momentum=0.9, weight_decay=0.0001, nesterov=True)
+                    current_optimizer = 'sgd_2'
+                    drop_counter = start_epoch - 80
+                elif start_epoch >= 100:
+                    self.optimizer = torch.optim.SGD(self.model.parameters(), 0.00001, momentum=0.9, weight_decay=0.0001, nesterov=True)
+                    current_optimizer = 'sgd_3'
+                    drop_counter = start_epoch - 100
+
+        for epoch in range(start_epoch, self.n_epochs):
             print('Training')
             drop_counter += 1
             # train
@@ -84,9 +229,12 @@ class Solver():
             step_loss = 0
             epoch_loss = 0
             
-            # 每个epoch开始时清理GPU缓存
+            # 每个epoch开始时清理GPU缓存并检查温度
             if self.is_cuda:
                 torch.cuda.empty_cache()
+            
+            # 检查温度
+            self.check_temperatures()
                 
             for i1, i2 in zip(self.data_loader1, self.data_loader2):
                 ctr += 1
@@ -158,16 +306,24 @@ class Solver():
             if roc_auc > best_roc_auc:
                 print('best model: %4f' % roc_auc)
                 best_roc_auc = roc_auc
-                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, 'best_model.pth'))
+                self.save(os.path.join(self.model_save_path, 'best_model.pth'))
                 # 记录最佳模型指标
                 swanlab.log({
                     "best/roc_auc": best_roc_auc,
                     "best/epoch": epoch+1
                 })
 
-            if epoch%10 ==0:
-                print(f'Saving model at epoch {epoch}')
-                torch.save(self.model.state_dict(), os.path.join(self.model_save_path, f'model_epoch_{epoch}.pth'))
+            # 每个epoch都保存检查点
+            checkpoint_path = os.path.join(self.model_save_path, f'model_epoch_{epoch + 1}.pth')
+            self.save(checkpoint_path)
+            print(f'Saved checkpoint at epoch {epoch + 1} to {checkpoint_path}')
+            
+            # 记录检查点信息到SwanLab，只记录epoch数和性能指标
+            swanlab.log({
+                "checkpoint/epoch": epoch + 1,
+                "checkpoint/roc_auc": roc_auc,
+                "checkpoint/pr_auc": pr_auc
+            })
 
             # schedule optimizer
             current_optimizer, drop_counter = self._schedule(current_optimizer, drop_counter)
