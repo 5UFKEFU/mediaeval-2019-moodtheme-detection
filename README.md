@@ -14,8 +14,7 @@ python main.py --mode train --test
 验证集：只使用前20条数据
 测试集：只使用前20条数据
 
-
-
+image.png
 
 
 

@@ -23,28 +23,16 @@ from collections import defaultdict
 # 设置 OpenAI API 密钥
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
-# 加载标签映射
-with open('../data/data/tag_map.json', 'r', encoding='utf-8') as f:
-    TAG_MAP = json.load(f)
+# 从all_tags.txt读取标签
+def load_labels(label_file):
+    with open(label_file, 'r', encoding='utf-8') as f:
+        labels = [line.strip() for line in f if line.strip()]
+    return labels
 
-# 创建官方标签列表
-OFFICIAL_LABELS = {}
-OFFICIAL_LABEL_LIST = []
-
-# 添加mood/theme标签
-for tag in sorted(set(TAG_MAP['mood/theme'].values())):
-    OFFICIAL_LABELS[f"mood/theme---{tag}"] = tag
-    OFFICIAL_LABEL_LIST.append(f"mood/theme---{tag}")
-
-# 添加genre标签
-for tag in sorted(set(TAG_MAP['genre'].values())):
-    OFFICIAL_LABELS[f"genre---{tag}"] = tag
-    OFFICIAL_LABEL_LIST.append(f"genre---{tag}")
-
-# 添加instrument标签
-for tag in sorted(set(TAG_MAP['instrument'].values())):
-    OFFICIAL_LABELS[f"instrument---{tag}"] = tag
-    OFFICIAL_LABEL_LIST.append(f"instrument---{tag}")
+# 加载标签
+LABEL_FILE = 'data/tags/all_tags.txt'
+OFFICIAL_LABEL_LIST = load_labels(LABEL_FILE)
+OFFICIAL_LABELS = {tag: tag.split('---')[1] for tag in OFFICIAL_LABEL_LIST}
 
 # 用于记录非官方标签的字典
 non_official_tags = defaultdict(int)
@@ -128,9 +116,43 @@ def analyze_music_files(directory, model_path):
     # 加载模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MusicSelfAttModel()
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device)
+    print("\nDebug - Model checkpoint keys:")
+    if isinstance(checkpoint, dict):
+        print(f"Checkpoint keys: {list(checkpoint.keys())}")
+        if 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+        else:
+            model.load_state_dict(checkpoint)
+    else:
+        model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
+    
+    # 打印模型结构
+    print("\nDebug - Model structure:")
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.shape}")
+    
+    # 打印标签信息
+    print("\nDebug - Label Information:")
+    print(f"Total labels: {len(OFFICIAL_LABEL_LIST)}")
+    print(f"Theme labels: {len([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('theme---')])}")
+    print(f"Genre labels: {len([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('genre---')])}")
+    print(f"Instrument labels: {len([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('instrument---')])}")
+    
+    # 打印前几个标签
+    print("\nDebug - First few labels:")
+    for i, tag in enumerate(OFFICIAL_LABEL_LIST[:10]):
+        print(f"{i}: {tag}")
+    
+    # 打印theme标签的位置
+    print("\nDebug - Theme label positions:")
+    for i, tag in enumerate(OFFICIAL_LABEL_LIST):
+        if tag.startswith('theme---'):
+            print(f"{i}: {tag}")
+            if i < 10:  # 只打印前10个
+                break
     
     # 设置音频预处理参数
     spect_len = 4096
@@ -155,7 +177,8 @@ def analyze_music_files(directory, model_path):
         song_name, artist = extract_song_info(filename)
         if not song_name or not artist:
             print(f"无法解析文件名: {filename}")
-            continue
+            song_name = filename[:-4]  # 使用文件名作为歌曲名
+            artist = "Unknown"  # 使用Unknown作为艺术家名
             
         # 加载音频文件
         audio_path = os.path.join(directory, filename)
@@ -179,19 +202,56 @@ def analyze_music_files(directory, model_path):
             # 模型预测
             with torch.no_grad():
                 att, clf = model(audio)
-                predicted_indices = clf.topk(5)[1].tolist()[0]  # 获取前5个预测标签的索引
-                predicted_tags = [OFFICIAL_LABEL_LIST[idx] for idx in predicted_indices]  # 转换为实际标签
+                print("\nDebug - Model outputs:")
+                print(f"att shape: {att.shape}")
+                print(f"clf shape: {clf.shape}")
+                print(f"att min: {att.min().item():.4f}, max: {att.max().item():.4f}, mean: {att.mean().item():.4f}")
+                print(f"clf min: {clf.min().item():.4f}, max: {clf.max().item():.4f}, mean: {clf.mean().item():.4f}")
+                
+                # 检查两个输出的相关性
+                print("\nDebug - Output comparison:")
+                for i in range(5):  # 检查前5个标签
+                    print(f"Label {i}: att={att[0,i].item():.4f}, clf={clf[0,i].item():.4f}")
+                
+                # 检查theme标签的索引和分数
+                theme_indices = [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('theme---')]
+                print("\nDebug - Theme label details:")
+                for idx in theme_indices[:10]:  # 只显示前10个theme标签
+                    print(f"Index {idx}: {OFFICIAL_LABEL_LIST[idx]} = att:{att[0,idx].item():.4f}, clf:{clf[0,idx].item():.4f}")
+                
+                # 使用两个输出的平均值
+                all_scores = ((att[0] + clf[0]) / 2).tolist()
+                
+                # 分别获取不同类型的标签
+                theme_scores = [(all_scores[idx], idx) for idx in theme_indices]
+                genre_scores = [(all_scores[idx], idx) for idx in [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('genre---')]]
+                instrument_scores = [(all_scores[idx], idx) for idx in [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('instrument---')]]
+                
+                # 选择每个类型的前几个标签
+                theme_top = sorted(theme_scores, reverse=True)[:5]  # 取前5个theme标签
+                genre_top = sorted(genre_scores, reverse=True)[:5]  # 取前5个genre标签
+                instrument_top = sorted(instrument_scores, reverse=True)[:5]  # 取前5个instrument标签
+                
+                # 合并所有选中的标签
+                selected_indices = [idx for _, idx in theme_top + genre_top + instrument_top]
+                predicted_tags = [OFFICIAL_LABEL_LIST[idx] for idx in selected_indices]
+                
+                # 保存所有标签的分数
+                all_tag_scores = {OFFICIAL_LABEL_LIST[i]: score for i, score in enumerate(all_scores)}
             
-            # 获取在线标签
-            online_tags = get_online_tags(song_name, artist)
+            # 获取在线标签（只在成功解析文件名时）
+            online_tags = []
+            if song_name != filename[:-4] and artist != "Unknown":
+                online_tags = get_online_tags(song_name, artist)
             
             results.append({
                 'filename': filename,
                 'song_name': song_name,
                 'artist': artist,
                 'model_predictions': predicted_tags,
-                'model_predictions_indices': predicted_indices,
-                'online_tags': online_tags
+                'model_predictions_indices': selected_indices,
+                'online_tags': online_tags,
+                'all_tag_scores': all_tag_scores
             })
             
         except Exception as e:
@@ -204,6 +264,23 @@ def save_results(results, output_file):
     # 添加中文标签到结果中
     for result in results:
         result['model_predictions_chinese'] = [OFFICIAL_LABELS[tag] for tag in result['model_predictions']]
+        
+        # 添加所有标签的分数
+        print(f"\n歌曲: {result['song_name']} - {result['artist']}")
+        print("\n主题标签预测分数:")
+        theme_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('theme---')}
+        for tag, score in sorted(theme_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.4f}")
+            
+        print("\n风格标签预测分数:")
+        genre_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('genre---')}
+        for tag, score in sorted(genre_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.4f}")
+            
+        print("\n乐器标签预测分数:")
+        instrument_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('instrument---')}
+        for tag, score in sorted(instrument_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.4f}")
     
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -224,6 +301,27 @@ if __name__ == "__main__":
     model_path = "models/best_model.pth"  # 替换为实际的模型路径
     output_file = "analysis_results.json"
     
+    # 打印所有可能的标签
+    print("\n所有可能的标签：")
+    
+    # 主题标签
+    print("\n主题标签 (Theme):")
+    theme_labels = sorted([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('theme---')])
+    for tag in theme_labels:
+        print(f"  - {tag.split('---')[1]}")
+    
+    # 风格标签
+    print("\n风格标签 (Genre):")
+    genre_labels = sorted([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('genre---')])
+    for tag in genre_labels:
+        print(f"  - {tag.split('---')[1]}")
+    
+    # 乐器标签
+    print("\n乐器标签 (Instrument):")
+    instrument_labels = sorted([tag for tag in OFFICIAL_LABEL_LIST if tag.startswith('instrument---')])
+    for tag in instrument_labels:
+        print(f"  - {tag.split('---')[1]}")
+    
     # 分析音乐文件
     results = analyze_music_files(music_directory, model_path)
     
@@ -233,18 +331,37 @@ if __name__ == "__main__":
     # 保存非官方标签统计
     save_non_official_tags()
     
-    print(f"分析完成！结果已保存到 {output_file}")
+    print(f"\n分析完成！结果已保存到 {output_file}")
     
     # 打印结果摘要
     print("\n分析结果摘要：")
     for result in results:
         print(f"\n歌曲: {result['song_name']} - {result['artist']}")
-        print("模型预测标签:")
+        
+        # 显示主题标签预测分数
+        print("\n主题标签预测分数:")
+        theme_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('theme---')}
+        for tag, score in sorted(theme_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.2f}")
+            
+        # 显示风格标签预测分数
+        print("\n风格标签预测分数:")
+        genre_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('genre---')}
+        for tag, score in sorted(genre_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.2f}")
+            
+        # 显示乐器标签预测分数
+        print("\n乐器标签预测分数:")
+        instrument_scores = {tag: score for tag, score in result['all_tag_scores'].items() if tag.startswith('instrument---')}
+        for tag, score in sorted(instrument_scores.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  - {tag}: {score:.2f}")
+            
+        print("\n最终选择的标签:")
         for tag in result['model_predictions']:
             print(f"  - {tag} ({OFFICIAL_LABELS[tag]})")
         print("在线标签:")
         for tag in result['online_tags']:
-            print(f"  - {tag} ({OFFICIAL_LABELS[tag]})") 
+            print(f"  - {tag} ({OFFICIAL_LABELS[tag]})")
 
 # Ensure to add your OpenAI API key
 #openai.api_key_path = 'models/openai_api_key.txt' 

@@ -171,17 +171,8 @@ def train():
         print(f"Resuming training from checkpoint: {config['resume_path']}")
         solver.load(config['resume_path'])
     
-    for epoch in range(10):  # Assuming a default range for epochs
-        solver.train()
-        # 每个epoch都保存检查点
-        checkpoint_path = os.path.join(config['log_dir'], f'model_epoch_{epoch}.pth')
-        solver.save(checkpoint_path)
-        print(f'Saved checkpoint at epoch {epoch} to {checkpoint_path}')
-        
-        # 记录检查点信息到SwanLab，只记录epoch数
-        swanlab.log({
-            "checkpoint/epoch": epoch+1
-        })
+    # 直接调用solver的train方法，它会处理从检查点恢复的逻辑
+    solver.train()
 
     # 如果是测试模式，清理临时文件
     if config['test_mode']:

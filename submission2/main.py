@@ -13,15 +13,15 @@ from dataloader import get_audio_loader
 from solver import Solver
 
 # Set paths
-PATH = '../data'
-DATA_PATH = f'{PATH}/mediaeval-2019-jamendo/'
-LABELS_TXT = f'{PATH}/moodtheme_split.txt'
-TRAIN_PATH = f'{PATH}/autotagging_moodtheme-train.tsv'
-VAL_PATH = f'{PATH}/autotagging_moodtheme-valid.tsv'
-TEST_PATH = f'{PATH}/autotagging_moodtheme-test.tsv'
+PATH = 'data'
+DATA_PATH = f'{PATH}/audio'
+LABELS_TXT = f'{PATH}/tags/moodtheme_split.txt'
+TRAIN_PATH = f'{PATH}/moodtheme-train.tsv'
+VAL_PATH = f'{PATH}/moodtheme-valid.tsv'
+TEST_PATH = f'{PATH}/moodtheme-test.tsv'
 
 CONFIG = {
-        'log_dir': './output',
+        'log_dir': './output2',
         'batch_size': 16,
         'num_workers': 4,
         'pin_memory': True,

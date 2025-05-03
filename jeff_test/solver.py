@@ -203,6 +203,10 @@ class Solver():
             match = re.search(r'model_epoch_(\d+)\.pth', self.config['resume_path'])
             if match:
                 start_epoch = int(match.group(1))
+                # 检查是否已经完成训练
+                if start_epoch >= self.n_epochs:
+                    print(f"Training already completed at epoch {start_epoch}. No need to resume.")
+                    return best_roc_auc, 0
                 print(f"Resuming from epoch {start_epoch}")
                 # 加载模型
                 self.load(self.config['resume_path'])
