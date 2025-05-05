@@ -28,7 +28,7 @@ from essentia.standard import MonoLoader, TensorflowPredictMusiCNN
 # Silence Essentia INFO and WARNING messages
 import essentia
 # 0 = silent, 1 = error, 2 = warning, 3 = info
-essentia._setDebugLevel(0,0)  # 完全静音，依靠 WarnOnce 打印首条错误即可
+essentia._setDebugLevel(0)  # 完全静音，依靠 WarnOnce 打印首条错误即可
 # 设置你要分析的目录
 MUSIC_DIR = './test_music'
 # OUTPUT_CSV = 'analysis_results.csv'
@@ -38,22 +38,21 @@ SUPPORTED_EXTENSIONS = ['.mp3', '.wav', '.flac', '.ogg', '.m4a']
 
 # 你要提取的标签
 TAGS = [
+    # Original tags
     'mood_happy', 'mood_sad', 'mood_relaxed',
     'mood_acoustic', 'mood_aggressive',
-    'mood_electronic', 'danceability',
-    'gender'
+    'mood_electronic', 'danceability', 'gender',
+    # Additional models
+    'mood_party', 'moods_mirex',
+    'genre_dortmund', 'genre_electronic',
+    'genre_rosamerica', 'genre_tzanetakis',
+    'tonal_atonal', 'voice_instrumental',
+    'urbansound8k', 'fs_loop_ds'
 ]
 
-# 标签与模型文件的映射
+# 标签与模型文件的映射（统一命名规则）
 model_files = {
-    'mood_happy': 'essentia_models/mood_happy-musicnn-msd-2.pb',
-    'mood_sad': 'essentia_models/mood_sad-musicnn-msd-2.pb',
-    'mood_relaxed': 'essentia_models/mood_relaxed-musicnn-msd-2.pb',
-    'mood_acoustic': 'essentia_models/mood_acoustic-musicnn-msd-2.pb',
-    'mood_aggressive': 'essentia_models/mood_aggressive-musicnn-msd-2.pb',
-    'mood_electronic': 'essentia_models/mood_electronic-musicnn-msd-2.pb',
-    'danceability': 'essentia_models/danceability-musicnn-msd-2.pb',
-    'gender': 'essentia_models/gender-musicnn-msd-2.pb'
+    tag: f"essentia_models/{tag}-musicnn-msd-2.pb" for tag in TAGS
 }
 
 # 加载模型一次（共享）
