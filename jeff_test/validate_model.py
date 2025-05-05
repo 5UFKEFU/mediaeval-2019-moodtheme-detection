@@ -7,6 +7,7 @@ from model import MusicSelfAttModel
 from dataloader import get_spectrogram
 from transforms import get_transforms
 from collections import defaultdict
+import argparse
 
 # 从all_tags.txt读取标签
 def load_labels(label_file):
@@ -15,13 +16,13 @@ def load_labels(label_file):
     return labels
 
 # 加载标签
-#LABEL_FILE = 'data/tags/all_tags.txt'
-LABEL_FILE = 'data/tags/moodtheme.txt'
+LABEL_FILE = 'data/tags/all_tags.txt'
+#LABEL_FILE = 'data/tags/moodtheme_split.txt'
 
 OFFICIAL_LABEL_LIST = load_labels(LABEL_FILE)
 OFFICIAL_LABELS = {tag: tag.split('---')[1] for tag in OFFICIAL_LABEL_LIST}
 
-def validate_model(model_path, tsv_file, num_samples=100):
+def validate_model(model_path, tsv_file, num_samples=100, label_type='theme'):
     """验证模型在真实数据上的表现"""
     # 加载模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -73,15 +74,20 @@ def validate_model(model_path, tsv_file, num_samples=100):
     )
     
     # 用于统计各类标签的准确率
-    theme_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
-    genre_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
-    instrument_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+    stats_dict = {
+        'theme': defaultdict(lambda: {'correct': 0, 'total': 0}),
+        'genre': defaultdict(lambda: {'correct': 0, 'total': 0}),
+        'instrument': defaultdict(lambda: {'correct': 0, 'total': 0}),
+    }
     
     results = []
     for _, row in sample_df.iterrows():
         try:
-            # 获取真实标签
-            ground_truth_tags = [tag.replace('mood/theme---', 'theme---') for tag in row['TAGS'].split('\t')]
+            print("\n" + "="*80)  # 添加分隔线
+            # 统一标签格式
+            ground_truth_tags = [tag if tag.startswith('mood/theme---') or tag.startswith('genre---') or tag.startswith('instrument---')
+                                 else f"mood/theme---{tag.split('---')[1]}"
+                                 for tag in row['TAGS'].split('\t') if tag]
             
             # 加载音频文件
             audio_path = os.path.join('data/audio', row['PATH'])
@@ -100,51 +106,47 @@ def validate_model(model_path, tsv_file, num_samples=100):
                 all_scores = ((att[0] + clf[0]) / 2).tolist()
                 
                 # 获取每个类别的前几个预测
-                theme_indices = [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('theme---')]
+                theme_indices = [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('mood/theme---')]
                 genre_indices = [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('genre---')]
                 instrument_indices = [i for i, tag in enumerate(OFFICIAL_LABEL_LIST) if tag.startswith('instrument---')]
                 
-                # 打印主题标签的预测分数
-                print("\n主题标签预测分数:")
-                theme_scores = [(all_scores[idx], idx) for idx in theme_indices]
-                for score, idx in sorted(theme_scores, reverse=True)[:10]:
-                    print(f"{OFFICIAL_LABEL_LIST[idx]}: {score:.4f}")
+                # 根据label_type选择
+                if label_type == 'theme':
+                    indices = theme_indices
+                    label_prefix = 'mood/theme---'
+                elif label_type == 'genre':
+                    indices = genre_indices
+                    label_prefix = 'genre---'
+                elif label_type == 'instrument':
+                    indices = instrument_indices
+                    label_prefix = 'instrument---'
+                else:
+                    raise ValueError(f"未知的label_type: {label_type}")
                 
-                theme_scores = [(all_scores[idx], idx) for idx in theme_indices]
-                genre_scores = [(all_scores[idx], idx) for idx in genre_indices]
-                instrument_scores = [(all_scores[idx], idx) for idx in instrument_indices]
-                
-                theme_top = sorted(theme_scores, reverse=True)[:5]
-                genre_top = sorted(genre_scores, reverse=True)[:5]
-                instrument_top = sorted(instrument_scores, reverse=True)[:5]
-                
-                predicted_indices = [idx for _, idx in theme_top + genre_top + instrument_top]
+                scores = [(all_scores[idx], idx) for idx in indices if idx < len(all_scores)]
+                scores.sort(reverse=True)
+                # 只保留分数大于0.1的标签
+                filtered_scores = [(score, idx) for score, idx in scores if score > 0.1]
+                top_scores = filtered_scores[:5]  # 最多取前5个
+                predicted_indices = [idx for score, idx in top_scores]
                 predicted_tags = [OFFICIAL_LABEL_LIST[idx] for idx in predicted_indices]
+                predicted_scores = [score for score, idx in top_scores]
             
             # 计算准确率指标
-            correct_predictions = set(predicted_tags) & set(ground_truth_tags)
+            gt_tags = [tag for tag in ground_truth_tags if tag.startswith(label_prefix)]
+            correct_predictions = set(predicted_tags) & set(gt_tags)
             precision = len(correct_predictions) / len(predicted_tags) if predicted_tags else 0
-            recall = len(correct_predictions) / len(ground_truth_tags) if ground_truth_tags else 0
+            recall = len(correct_predictions) / len(gt_tags) if gt_tags else 0
             f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
             
             # 更新标签统计
-            for tag in ground_truth_tags:
-                if tag.startswith('theme---'):
-                    theme_stats[tag]['total'] += 1
-                    if tag in predicted_tags:
-                        theme_stats[tag]['correct'] += 1
-                        print(f"\n正确预测的主题标签: {tag}")
-                    else:
-                        print(f"\n未预测到的主题标签: {tag}")
-                elif tag.startswith('genre---'):
-                    genre_stats[tag]['total'] += 1
-                    if tag in predicted_tags:
-                        genre_stats[tag]['correct'] += 1
-                elif tag.startswith('instrument---'):
-                    instrument_stats[tag]['total'] += 1
-                    if tag in predicted_tags:
-                        instrument_stats[tag]['correct'] += 1
-            
+            for tag in gt_tags:
+                stats_dict[label_type][tag]['total'] += 1
+                if tag in predicted_tags:
+                    stats_dict[label_type][tag]['correct'] += 1
+                else:
+                    pass
+
             results.append({
                 'track_id': row['TRACK_ID'],
                 'ground_truth': ground_truth_tags,
@@ -154,16 +156,28 @@ def validate_model(model_path, tsv_file, num_samples=100):
                 'f1': f1
             })
             
-            # 打印当前曲目的结果
-            print(f"\n曲目 ID: {row['TRACK_ID']}")
-            print(f"真实标签: {', '.join(ground_truth_tags)}")
-            print(f"预测标签: {', '.join(predicted_tags)}")
-            print(f"精确率: {precision:.2f}, 召回率: {recall:.2f}, F1分数: {f1:.2f}")
-            
-            # 在 validate_model.py 中添加调试信息
-            print("\n模型输出分数分布:")
-            print(f"Attention 输出: min={att.min().item():.4f}, max={att.max().item():.4f}, mean={att.mean().item():.4f}")
-            print(f"Classifier 输出: min={clf.min().item():.4f}, max={clf.max().item():.4f}, mean={clf.mean().item():.4f}")
+            # 紧凑输出结果（改为多行+分数+中/未中）
+            print(f"曲目ID: {row['TRACK_ID']}")
+
+            # 真实标签部分，标注"中"或"未中"
+            gt_tag_names = []
+            for tag in gt_tags:
+                tag_name = tag.split('---')[1]
+                if tag in predicted_tags:
+                    gt_tag_names.append(f"{tag_name}(中)")
+                else:
+                    gt_tag_names.append(f"{tag_name}(未中)")
+            print(f"真实: {', '.join(gt_tag_names)}")
+
+            # 预测标签部分，带分数
+            pred_strs = []
+            for tag, score in zip(predicted_tags, predicted_scores):
+                tag_name = tag.split('---')[1]
+                pred_strs.append(f"{tag_name}({score:.1f})")
+            print(f"预测: {', '.join(pred_strs)}")
+
+            print(f"P: {precision:.2f} R: {recall:.2f} F1: {f1:.2f}")
+            print(f"模型输出: Att[{att.min().item():.3f}, {att.max().item():.3f}] Clf[{clf.min().item():.3f}, {clf.max().item():.3f}]")
             
         except Exception as e:
             print(f"处理曲目 {row['TRACK_ID']} 时出错: {str(e)}")
@@ -174,43 +188,33 @@ def validate_model(model_path, tsv_file, num_samples=100):
         avg_recall = sum(r['recall'] for r in results) / len(results)
         avg_f1 = sum(r['f1'] for r in results) / len(results)
         
-        print("\n总体验证结果:")
-        print(f"平均精确率: {avg_precision:.2f}")
-        print(f"平均召回率: {avg_recall:.2f}")
-        print(f"平均F1分数: {avg_f1:.2f}")
-        print(f"处理的曲目数量: {len(results)}")
+        print("\n" + "="*80)
+        print("总体验证结果:")
+        print(f"平均精确率: {avg_precision:.2f} | 平均召回率: {avg_recall:.2f} | 平均F1分数: {avg_f1:.2f}")
+        print(f"处理曲目数量: {len(results)}")
         
-        # 打印各类标签的准确率
-        print("\n主题标签准确率:")
-        for tag, stats in theme_stats.items():
+        # 打印各类标签的准确率（紧凑格式）
+        print(f"\n{label_type}标签准确率:")
+        for tag, stats in stats_dict[label_type].items():
             accuracy = stats['correct'] / stats['total'] if stats['total'] > 0 else 0
-            print(f"{tag}: {accuracy:.2f} ({stats['correct']}/{stats['total']})")
-        
-        print("\n风格标签准确率:")
-        for tag, stats in genre_stats.items():
-            accuracy = stats['correct'] / stats['total'] if stats['total'] > 0 else 0
-            print(f"{tag}: {accuracy:.2f} ({stats['correct']}/{stats['total']})")
-        
-        print("\n乐器标签准确率:")
-        for tag, stats in instrument_stats.items():
-            accuracy = stats['correct'] / stats['total'] if stats['total'] > 0 else 0
-            print(f"{tag}: {accuracy:.2f} ({stats['correct']}/{stats['total']})")
+            print(f"{tag.split('---')[1]}: {accuracy:.2f} ({stats['correct']}/{stats['total']})", end=" | ")
+        print()
 
 if __name__ == "__main__":
-    # 配置参数
-    model_path = "models/best_model.pth"
-    tsv_file = "data/autotagging_moodtheme.tsv"
-    num_samples = 10  # 验证的曲目数量
-    
-    # 运行验证
-    validate_model(model_path, tsv_file, num_samples)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, default="output2/best_model.pth")
+    parser.add_argument('--num_samples', type=int, default=100)
+    parser.add_argument('--label_type', type=str, choices=['theme', 'genre', 'instrument'], default='theme')
+    args = parser.parse_args()
 
-# 在训练前添加数据分布分析
-theme_counts = defaultdict(int)
-for _, row in train_df.iterrows():
-    for tag in row['TAGS'].split('\t'):
-        if tag.startswith('mood/theme---'):
-            theme_counts[tag] += 1
-print("\n主题标签分布:")
-for tag, count in sorted(theme_counts.items(), key=lambda x: x[1], reverse=True):
-    print(f"{tag}: {count}") 
+    # 根据 label_type 选择 tsv 文件
+    if args.label_type == 'theme':
+        tsv_file = "data/autotagging_moodtheme.tsv"
+    elif args.label_type == 'genre':
+        tsv_file = "data/autotagging_genre.tsv"
+    elif args.label_type == 'instrument':
+        tsv_file = "data/autotagging_instrument.tsv"
+    else:
+        raise ValueError(f"未知的label_type: {args.label_type}")
+
+    validate_model(args.model_path, tsv_file, args.num_samples, args.label_type) 

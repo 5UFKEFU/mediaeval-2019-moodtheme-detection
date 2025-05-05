@@ -34,7 +34,7 @@ TEST_PATHS = [
 ]
 
 CONFIG = {
-        'log_dir': './output',
+        'log_dir': './output2',
         'batch_size': 8,
         'num_workers': 2,
         'pin_memory': False,

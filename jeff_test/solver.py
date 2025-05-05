@@ -46,6 +46,13 @@ class Solver():
             except Exception as e:
                 print(f"Warning: Could not set GPU temperature threshold: {e}")
             
+            # 设置GPU内存分配策略
+            torch.cuda.set_per_process_memory_fraction(0.9)  # 限制GPU内存使用为90%
+            torch.cuda.set_device(0)  # 明确指定使用第一个GPU
+            
+            # 启用混合精度训练
+            self.scaler = torch.cuda.amp.GradScaler()
+            
         self.model_save_path = config['log_dir']
         self.batch_size = config['batch_size']
         self.tag_list = tag_list
@@ -193,7 +200,7 @@ class Solver():
         current_optimizer = 'adam'
         best_roc_auc = 0
         drop_counter = 0
-        reconst_loss = nn.BCELoss()
+        reconst_loss = nn.BCEWithLogitsLoss()
 
         # 获取起始epoch
         start_epoch = 0
@@ -257,19 +264,21 @@ class Solver():
                 x = self.to_var(inputs)
                 y = self.to_var(labels)
 
-                # predict
-                att,clf = self.model(x)
-                loss1 = reconst_loss(att, y)
-                loss2 = reconst_loss(clf,y)
-                loss = (loss1+loss2)/2
+                # predict with mixed precision
+                with torch.cuda.amp.autocast():
+                    att, clf = self.model(x)
+                    loss1 = reconst_loss(att, y)
+                    loss2 = reconst_loss(clf, y)
+                    loss = (loss1 + loss2) / 2
 
                 step_loss += loss.item()
                 epoch_loss += loss.item()
 
-                # back propagation
+                # back propagation with mixed precision
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 # 清理不需要的变量
                 del x, y, att, clf, loss1, loss2, loss
@@ -344,7 +353,7 @@ class Solver():
         gt_array = []   # ground truth
         ctr = 0
         self.model.eval()
-        reconst_loss = nn.BCELoss()
+        reconst_loss = nn.BCEWithLogitsLoss()
         for x, y in self.valid_loader:
             ctr += 1
 
@@ -352,11 +361,12 @@ class Solver():
             x = self.to_var(x)
             y = self.to_var(y)
 
-            # predict
-            att,clf = self.model(x)
-            loss1 = reconst_loss(att, y)
-            loss2 = reconst_loss(clf,y)
-            loss = (loss1+loss2)/2
+            # predict with mixed precision
+            with torch.cuda.amp.autocast(), torch.no_grad():
+                att, clf = self.model(x)
+                loss1 = reconst_loss(att, y)
+                loss2 = reconst_loss(clf, y)
+                loss = (loss1 + loss2) / 2
 
             # print log
             if (ctr) % self.log_step == 0:
@@ -467,7 +477,7 @@ class Solver():
 
     def test(self):
         start_t = time.time()
-        reconst_loss = nn.BCELoss()
+        reconst_loss = nn.BCEWithLogitsLoss()
         epoch = 0
 
         self.load(self.model_fn)
@@ -482,10 +492,11 @@ class Solver():
             x = self.to_var(x)
             y = self.to_var(y)
 
-            # predict
-            out1, out2 = self.model(x)
-            out = (out1+out2)/2
-            loss = reconst_loss(out, y)
+            # predict with mixed precision
+            with torch.cuda.amp.autocast(), torch.no_grad():
+                out1, out2 = self.model(x)
+                out = (out1 + out2) / 2
+                loss = reconst_loss(out, y)
 
             # print log
             if (ctr) % self.log_step == 0:

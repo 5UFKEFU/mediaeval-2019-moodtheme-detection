@@ -17,15 +17,14 @@ class MusicSelfAttModel(nn.Module):
         self.att_model = nn.Sequential(
             AttentionModule(),
             nn.Dropout(0.2),
-            nn.Linear(HIDDEN_SIZE, NUM_CLASSES),
-            nn.Sigmoid()
+            nn.Linear(HIDDEN_SIZE, NUM_CLASSES)
             )
         self.classifier = nn.Sequential(
              nn.Dropout(0.2),
              nn.Linear(256,256),
              nn.Dropout(0.2),
-             nn.Linear(256, NUM_CLASSES),
-             nn.Sigmoid())
+             nn.Linear(256, NUM_CLASSES)
+             )
         
     def forward(self, x):
         # x: (batch, 1, freq, time)
