@@ -33,25 +33,9 @@ venv.bak/
 /jeff_test/test_music
 /jeff_test/data/download
 /jeff_test/data
-<<<<<<< HEAD
 /jeff_test/output2
-=======
-
-/submission2/output
-/submission2/output - 副本
-/submission2/test_music
-/submission2/analysis_results.json
-/submission2/models/openai_api_key.txt
-/submission2/models/events.out.tfevents.*
-/submission2/__pycache__
-
-# 忽略所有子目录下的 __pycache__
-*/__pycache__/
-
-# 其他
-# 忽略所有隐藏文件（可选，谨慎使用）
-# .*
->>>>>>> 4962c23 (更新.gitignore，添加对刘德华音乐文件的忽略)
 jeff_test/刘德华-忘情水.mp3
 jeff_test/刘德华-忘情水.wav
 jeff_test/clip_30s.wav
+.venv/
+

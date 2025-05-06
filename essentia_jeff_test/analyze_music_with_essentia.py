@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import numpy as np
 
 # --- Show at most one "No network created ..." warning ---
 _warn_re = re.compile(r"No network created, or last created network has been deleted")
@@ -50,57 +51,105 @@ TAGS = [
     'urbansound8k', 'fs_loop_ds'
 ]
 
-# 标签与模型文件的映射（统一命名规则）
-def find_model_files():
-    model_dir = "essentia_models"
-    model_files = {}
-    if os.path.exists(model_dir):
-        for filename in os.listdir(model_dir):
-            if "msd" in filename and filename.endswith(".pb") and not filename.startswith('._'):
-                # 从文件名中提取标签名（假设格式为 tag-msd-2.pb）
-                tag = filename.split("-")[0]
-                model_files[tag] = os.path.join(model_dir, filename)
-    return model_files
-
-def get_output_node(model_file):
-    # 版本1的模型使用 Softmax，版本2的模型使用 Sigmoid
-    return 'model/Softmax' if '-msd-1.pb' in model_file else 'model/Sigmoid'
-
-model_files = find_model_files()
-
-# 只使用实际存在的模型
-available_tags = set(model_files.keys())
-TAGS = [tag for tag in TAGS if tag in available_tags]
-
-# 加载模型一次（共享）
-# reloadGraph=False  ->  仅在算法实例化时构建网络；后续调用复用同一网络
-models = {
-    tag: TensorflowPredictMusiCNN(
-        graphFilename=model_files[tag],
-        output=get_output_node(model_files[tag])
-    ) for tag in TAGS
+# 定义模型文件路径和对应的输出节点
+model_configs = {
+    'mood_happy': {
+        'file': 'essentia_models/mood_happy-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_sad': {
+        'file': 'essentia_models/mood_sad-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_relaxed': {
+        'file': 'essentia_models/mood_relaxed-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_acoustic': {
+        'file': 'essentia_models/mood_acoustic-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_aggressive': {
+        'file': 'essentia_models/mood_aggressive-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_electronic': {
+        'file': 'essentia_models/mood_electronic-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'danceability': {
+        'file': 'essentia_models/danceability-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'gender': {
+        'file': 'essentia_models/gender-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'mood_party': {
+        'file': 'essentia_models/mood_party-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'moods_mirex': {
+        'file': 'essentia_models/moods_mirex-musicnn-msd-1.pb',
+        'output': 'model/Softmax'
+    },
+    'genre_tzanetakis': {
+        'file': 'essentia_models/genre_tzanetakis-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'tonal_atonal': {
+        'file': 'essentia_models/tonal_atonal-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    },
+    'voice_instrumental': {
+        'file': 'essentia_models/voice_instrumental-musicnn-msd-2.pb',
+        'output': 'model/Sigmoid'
+    }
 }
 
 def analyze_file(filepath):
     try:
-        audio = MonoLoader(filename=filepath)()
+        print(f"正在分析文件: {filepath}")
+        # 加载音频文件，重采样到16kHz
+        audio = MonoLoader(filename=filepath, sampleRate=16000, resampleQuality=4)()
+        print(f"音频加载成功，长度: {len(audio)}")
+        
+        # 初始化模型
+        models = {}
+        for tag, config in model_configs.items():
+            models[tag] = TensorflowPredictMusiCNN(
+                graphFilename=config['file'],
+                output=config['output']
+            )
+        
         result = {}
         for tag, model in models.items():
-            prediction = model(audio)  # 可能返回 (frames, tags) 或 (tags,)
-            if prediction.ndim == 2:
-                prediction = prediction.mean(axis=0)  # 每个标签取时间平均
-            prediction = prediction.flatten()
-
-            if prediction.size == 1:
-                result[tag] = round(float(prediction[0]), 3)
-            elif prediction.size == 2:
-                result[tag] = round(float(prediction[1]), 3)
+            print(f"处理标签: {tag}")
+            prediction = model(audio)
+            
+            # 如果预测结果是矩阵，取时间维度的平均值
+            if isinstance(prediction, np.ndarray):
+                if prediction.ndim > 1:
+                    prediction = np.mean(prediction, axis=0)
+                if prediction.size > 1:
+                    prediction = prediction[0]
+            elif isinstance(prediction, list):
+                prediction = np.mean(prediction)
+            
+            # 确保结果在0-1之间
+            if tag == 'moods_mirex':
+                # Softmax输出，取最大值
+                result[tag] = float(np.max(prediction))
             else:
-                result[tag] = round(float(prediction.mean()), 3)
+                # Sigmoid输出，直接使用
+                result[tag] = float(prediction)
+            
+            print(f"{tag}: {result[tag]:.3f}")
+            
         return result
     except Exception as e:
-        print(f"[ERROR] {filepath} - {e}")
-        return None
+        print(f"处理文件时出错: {str(e)}")
+        return {}
 
 def main():
     for root, _, files in os.walk(MUSIC_DIR):
