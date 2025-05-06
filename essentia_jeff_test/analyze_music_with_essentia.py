@@ -3,15 +3,26 @@ import sys
 import re
 import numpy as np
 
-# 配置GPU内存增长
+# 是否使用GPU的开关
+USE_GPU = True  # 设置为False时强制只用CPU
+
+# 设置TensorFlow日志级别
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 只显示错误信息
 import tensorflow as tf
-physical_devices = tf.config.list_physical_devices('GPU')
-for device in physical_devices:
-    try:
-        tf.config.experimental.set_memory_growth(device, True)
-        print(f"已启用GPU设备的内存动态增长: {device}")
-    except:
-        print(f"无法为设备配置内存增长: {device}")
+tf.get_logger().setLevel('ERROR')
+
+if not USE_GPU:
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # 禁用所有GPU
+
+# 配置GPU内存增长（仅在使用GPU时）
+if USE_GPU:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    for device in physical_devices:
+        try:
+            tf.config.experimental.set_memory_growth(device, True)
+            print(f"已启用GPU设备的内存动态增长: {device}")
+        except:
+            print(f"无法为设备配置内存增长: {device}")
 
 # --- Show at most one "No network created ..." warning ---
 _warn_re = re.compile(r"No network created, or last created network has been deleted")
@@ -117,14 +128,30 @@ model_configs = {
     }
 }
 
+# 标签中英文对照表
+TAG_EXPLAIN = {
+    'mood_happy': '快乐情绪',
+    'mood_sad': '悲伤情绪',
+    'mood_relaxed': '放松情绪',
+    'mood_acoustic': '原声风格',
+    'mood_aggressive': '激烈情绪',
+    'mood_electronic': '电子风格',
+    'danceability': '舞蹈性',
+    'gender': '性别能量（男/女声）',
+    'mood_party': '派对氛围',
+    'moods_mirex': 'MIREX情绪组',
+    'genre_tzanetakis': 'Tzanetakis流派',
+    'tonal_atonal': '调性/无调性',
+    'voice_instrumental': '人声/器乐',
+    # 你可以根据需要补充其它标签
+}
+
 def analyze_file(filepath):
     try:
-        print(f"正在分析文件: {filepath}")
-        # 加载音频文件，重采样到16kHz
+        print(f"\n分析文件: {os.path.basename(filepath)}")
         audio = MonoLoader(filename=filepath, sampleRate=16000, resampleQuality=4)()
-        print(f"音频加载成功，长度: {len(audio)}")
         
-        # 初始化模型
+        # 每次分析时新建模型实例
         models = {}
         for tag, config in model_configs.items():
             models[tag] = TensorflowPredictMusiCNN(
@@ -134,7 +161,6 @@ def analyze_file(filepath):
         
         result = {}
         for tag, model in models.items():
-            print(f"处理标签: {tag}")
             prediction = model(audio)
             
             # 如果预测结果是矩阵，取时间维度的平均值
@@ -148,13 +174,18 @@ def analyze_file(filepath):
             
             # 确保结果在0-1之间
             if tag == 'moods_mirex':
-                # Softmax输出，取最大值
                 result[tag] = float(np.max(prediction))
             else:
-                # Sigmoid输出，直接使用
                 result[tag] = float(prediction)
             
-            print(f"{tag}: {result[tag]:.3f}")
+        # 显示所有标签结果（英文+中文）
+        print("全部特征:")
+        for tag, value in result.items():
+            zh = TAG_EXPLAIN.get(tag, '')
+            if zh:
+                print(f"  {tag}（{zh}）: {value:.3f}")
+            else:
+                print(f"  {tag}: {value:.3f}")
             
         return result
     except Exception as e:
@@ -162,15 +193,15 @@ def analyze_file(filepath):
         return {}
 
 def main():
+    print("开始分析音乐文件...")
     for root, _, files in os.walk(MUSIC_DIR):
         for file in files:
             if file.startswith('._'):
                 continue  # 跳过 macOS 资源派生文件
             if any(file.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
                 path = os.path.join(root, file)
-                analysis = analyze_file(path)
-                summary = ", ".join(f"{k}:{v:.3f}" for k, v in analysis.items())
-                print(f"{file} → {summary}")
+                analyze_file(path)
+    print("\n分析完成")
 
 if __name__ == '__main__':
     main()
