@@ -28,7 +28,7 @@ from essentia.standard import MonoLoader, TensorflowPredictMusiCNN
 # Silence Essentia INFO and WARNING messages
 import essentia
 # 0 = silent, 1 = error, 2 = warning, 3 = info
-essentia._setDebugLevel(0)  # 完全静音，依靠 WarnOnce 打印首条错误即可
+essentia._setDebugLevel(0,0)  # 完全静音，依靠 WarnOnce 打印首条错误即可
 # 设置你要分析的目录
 MUSIC_DIR = './test_music'
 # OUTPUT_CSV = 'analysis_results.csv'
@@ -51,16 +51,33 @@ TAGS = [
 ]
 
 # 标签与模型文件的映射（统一命名规则）
-model_files = {
-    tag: f"essentia_models/{tag}-musicnn-msd-2.pb" for tag in TAGS
-}
+def find_model_files():
+    model_dir = "essentia_models"
+    model_files = {}
+    if os.path.exists(model_dir):
+        for filename in os.listdir(model_dir):
+            if "msd" in filename and filename.endswith(".pb") and not filename.startswith('._'):
+                # 从文件名中提取标签名（假设格式为 tag-msd-2.pb）
+                tag = filename.split("-")[0]
+                model_files[tag] = os.path.join(model_dir, filename)
+    return model_files
+
+def get_output_node(model_file):
+    # 版本1的模型使用 Softmax，版本2的模型使用 Sigmoid
+    return 'model/Softmax' if '-msd-1.pb' in model_file else 'model/Sigmoid'
+
+model_files = find_model_files()
+
+# 只使用实际存在的模型
+available_tags = set(model_files.keys())
+TAGS = [tag for tag in TAGS if tag in available_tags]
 
 # 加载模型一次（共享）
 # reloadGraph=False  ->  仅在算法实例化时构建网络；后续调用复用同一网络
 models = {
     tag: TensorflowPredictMusiCNN(
         graphFilename=model_files[tag],
-        output='model/Sigmoid'
+        output=get_output_node(model_files[tag])
     ) for tag in TAGS
 }
 
